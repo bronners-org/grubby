@@ -1066,8 +1066,13 @@ func TestReposView_SquadFilterToggle_ShiftS(t *testing.T) {
 		t.Fatalf("expected 4 display repos initially, got %d", len(m.getDisplayRepos()))
 	}
 
-	// Press 'S' (Shift-S) to toggle squad filter on
-	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	// Press 'f' (Filter leader), then 's' (squad filter toggle)
+	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	if m.RepoLeaderMode != RepoLeaderFilter {
+		t.Fatalf("expected RepoLeaderFilter, got %v", m.RepoLeaderMode)
+	}
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m = updated.(Model)
 
 	if !m.SquadFilterActive {
@@ -1409,6 +1414,329 @@ func TestReposLeaderKeys_FilterOpenYankClaim(t *testing.T) {
 	sessToast := string(cmdYankS().(StatusToastMsg))
 	if !strings.Contains(sessToast, "Copied session name") {
 		t.Errorf("expected toast to mention copied session name, got %q", sessToast)
+	}
+}
+
+func TestReposView_SortLeader_Options(t *testing.T) {
+	now := time.Now()
+	repos := []github.Repository{
+		{Name: "repo-low-vuln", FullName: "org/repo-low-vuln", PushedAt: now.Add(-10 * time.Hour)},
+		{Name: "repo-high-vuln", FullName: "org/repo-high-vuln", PushedAt: now.Add(-5 * time.Hour)},
+		{Name: "repo-many-prs", FullName: "org/repo-many-prs", PushedAt: now.Add(-1 * time.Hour)},
+		{Name: "repo-newest", FullName: "org/repo-newest", PushedAt: now},
+	}
+
+	secSummaries := map[string]github.SecurityAlertSummary{
+		"repo-low-vuln":  {Total: 2, High: 1},
+		"repo-high-vuln": {Total: 20, Critical: 5, High: 10},
+		"repo-many-prs":  {Total: 0},
+		"repo-newest":    {Total: 0},
+	}
+
+	prs := []github.PullRequest{
+		{Number: 1, Repo: "repo-many-prs", RepoFullName: "org/repo-many-prs", Title: "PR 1", ReviewDecision: "APPROVED"},
+		{Number: 2, Repo: "repo-many-prs", RepoFullName: "org/repo-many-prs", Title: "PR 2", ReviewDecision: "REVIEW_REQUIRED"},
+		{Number: 3, Repo: "repo-low-vuln", RepoFullName: "org/repo-low-vuln", Title: "PR 3", ReviewDecision: "APPROVED"},
+	}
+
+	m := Model{
+		ActiveTab:         TabRepos,
+		Repos:             repos,
+		SecuritySummaries: secSummaries,
+		PRs:               prs,
+		ExpandedRepoPRs:   make(map[string]bool),
+		Width:             120,
+		Height:            30,
+	}
+
+	// 1. Press [S] -> verifies RepoLeaderSort is entered
+	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	m = updated.(Model)
+	if m.RepoLeaderMode != RepoLeaderSort {
+		t.Fatalf("expected RepoLeaderSort, got %v", m.RepoLeaderMode)
+	}
+
+	// 2. Press [v] -> sort by vulnerabilities
+	updated, cmdV := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	m = updated.(Model)
+	if m.RepoSortMode != RepoSortVulns {
+		t.Fatalf("expected RepoSortVulns, got %v", m.RepoSortMode)
+	}
+	if cmdV == nil {
+		t.Fatalf("expected toast cmd for vulns sort")
+	}
+	sortedRepos := m.getDisplayRepos()
+	if sortedRepos[0].Name != "repo-high-vuln" {
+		t.Fatalf("expected repo-high-vuln first in vuln sort, got %s", sortedRepos[0].Name)
+	}
+
+	// 3. Press [S] then [p] -> sort by pull requests & auto-expand repos with open PRs
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	m = updated.(Model)
+	updated, cmdP := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(Model)
+	if m.RepoSortMode != RepoSortPRs {
+		t.Fatalf("expected RepoSortPRs, got %v", m.RepoSortMode)
+	}
+	if cmdP == nil {
+		t.Fatalf("expected toast cmd for PRs sort")
+	}
+	sortedRepos = m.getDisplayRepos()
+	if sortedRepos[0].Name != "repo-many-prs" {
+		t.Fatalf("expected repo-many-prs first in PRs sort (has 2 PRs), got %s", sortedRepos[0].Name)
+	}
+	// Verify auto-expansion of repos with PRs
+	if !m.isRepoPRExpanded(&repos[2]) { // repo-many-prs
+		t.Fatalf("expected repo-many-prs to be auto-expanded in PR sort")
+	}
+
+	// 4. Press [S] then [l] -> sort by last updated
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	m = updated.(Model)
+	updated, cmdL := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.RepoSortMode != RepoSortLastUpdated {
+		t.Fatalf("expected RepoSortLastUpdated, got %v", m.RepoSortMode)
+	}
+	if cmdL == nil {
+		t.Fatalf("expected toast cmd for last updated sort")
+	}
+	sortedRepos = m.getDisplayRepos()
+	if sortedRepos[0].Name != "repo-newest" {
+		t.Fatalf("expected repo-newest first in last updated sort, got %s", sortedRepos[0].Name)
+	}
+
+	// 5. Press [Esc] -> clears sorting to default
+	updated, cmdEsc := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.RepoSortMode != RepoSortDefault {
+		t.Fatalf("expected RepoSortDefault after esc, got %v", m.RepoSortMode)
+	}
+	if cmdEsc == nil {
+		t.Fatalf("expected toast cmd after clearing sort with esc")
+	}
+}
+
+func TestReposView_SessionTopLevelCommand(t *testing.T) {
+	repos := []github.Repository{
+		{Name: "my-cloned-repo", FullName: "org/my-cloned-repo"},
+	}
+	gitStatuses := map[string]git.RepoGitStatus{
+		"my-cloned-repo": {IsCloned: true, LocalPath: "/tmp/my-cloned-repo"},
+	}
+	prs := []github.PullRequest{
+		{Number: 10, Repo: "my-cloned-repo", RepoFullName: "org/my-cloned-repo", Title: "PR 10"},
+	}
+
+	m := Model{
+		ActiveTab:       TabRepos,
+		Repos:           repos,
+		GitStatuses:     gitStatuses,
+		PRs:             prs,
+		ExpandedRepoPRs: map[string]bool{"my-cloned-repo": true, "org/my-cloned-repo": true},
+		Width:           120,
+		Height:          30,
+	}
+
+	// 1. On Tier Header: pressing 's' shows toast
+	m.RepoCursor = 0 // Tier header
+	items := m.getRepoTableItems()
+	if len(items) == 0 || items[0].Kind != ItemTierHeader {
+		t.Fatalf("expected item 0 to be ItemTierHeader")
+	}
+	_, cmdHeaderS := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if cmdHeaderS == nil {
+		t.Fatalf("expected toast cmd for session on tier header")
+	}
+	toast := string(cmdHeaderS().(StatusToastMsg))
+	if !strings.Contains(toast, "Select a repository to open session") {
+		t.Errorf("expected toast mentioning selecting a repo, got %q", toast)
+	}
+
+	// 2. On Repo row: pressing 's' switches/creates session
+	for idx, it := range items {
+		if it.Kind == ItemRepo {
+			m.RepoCursor = idx
+			break
+		}
+	}
+	_, cmdRepoS := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if cmdRepoS == nil {
+		t.Fatalf("expected cmd for session on repo row")
+	}
+
+	// 3. On PR row: pressing 's' launches session for parent repo
+	for idx, it := range items {
+		if it.Kind == ItemRepoPR {
+			m.RepoCursor = idx
+			break
+		}
+	}
+	_, cmdPRS := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if cmdPRS == nil {
+		t.Fatalf("expected cmd for session on PR row")
+	}
+}
+
+func TestReposView_AbsorbedPRCapabilities(t *testing.T) {
+	repos := []github.Repository{
+		{Name: "grubby", FullName: "bronners-org/grubby"},
+	}
+	gitStatuses := map[string]git.RepoGitStatus{
+		"grubby": {IsCloned: true, LocalPath: "/tmp/grubby"},
+	}
+	prs := []github.PullRequest{
+		{
+			Number:         12,
+			Repo:           "grubby",
+			RepoFullName:   "bronners-org/grubby",
+			Title:          "Approved PR",
+			Author:         "alice",
+			ReviewDecision: "APPROVED",
+			URL:            "https://github.com/bronners-org/grubby/pull/12",
+		},
+		{
+			Number:         13,
+			Repo:           "grubby",
+			RepoFullName:   "bronners-org/grubby",
+			Title:          "Pending Review PR",
+			Author:         "bob",
+			ReviewDecision: "REVIEW_REQUIRED",
+			URL:            "https://github.com/bronners-org/grubby/pull/13",
+		},
+	}
+
+	m := Model{
+		ActiveTab:       TabRepos,
+		Repos:           repos,
+		GitStatuses:     gitStatuses,
+		PRs:             prs,
+		ExpandedRepoPRs: map[string]bool{"grubby": true, "bronners-org/grubby": true},
+		Width:           120,
+		Height:          30,
+	}
+
+	items := m.getRepoTableItems()
+	pr12Idx := -1
+	pr13Idx := -1
+	for idx, it := range items {
+		if it.Kind == ItemRepoPR && it.PR != nil {
+			if it.PR.Number == 12 {
+				pr12Idx = idx
+			} else if it.PR.Number == 13 {
+				pr13Idx = idx
+			}
+		}
+	}
+	if pr12Idx == -1 || pr13Idx == -1 {
+		t.Fatalf("expected PR items in table, got items: %+v", items)
+	}
+
+	// 1. Merge approved PR #12 with 'm'
+	m.RepoCursor = pr12Idx
+	_, cmdMerge := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	if cmdMerge == nil {
+		t.Fatalf("expected merge cmd for approved PR #12")
+	}
+
+	// 2. Reject merge on non-approved PR #13 with 'm'
+	m.RepoCursor = pr13Idx
+	_, cmdReject := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	if cmdReject == nil {
+		t.Fatalf("expected toast cmd for non-approved PR #13")
+	}
+	toastMsg := string(cmdReject().(StatusToastMsg))
+	if !strings.Contains(toastMsg, "requires APPROVED") {
+		t.Errorf("expected toast mentioning requires APPROVED, got %q", toastMsg)
+	}
+
+	// 3. Checkout branch with 'k' on PR #12
+	m.RepoCursor = pr12Idx
+	_, cmdCheckoutK := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if cmdCheckoutK == nil {
+		t.Fatalf("expected checkout cmd with 'k'")
+	}
+
+	// 4. Checkout branch with 'c' on PR #12
+	_, cmdCheckoutC := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if cmdCheckoutC == nil {
+		t.Fatalf("expected checkout cmd with 'c'")
+	}
+
+	// 5. Yank PR URL with 'y' on PR #12
+	_, cmdYank := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmdYank == nil {
+		t.Fatalf("expected yank cmd with 'y'")
+	}
+	yankToast := string(cmdYank().(StatusToastMsg))
+	if !strings.Contains(yankToast, "https://github.com/bronners-org/grubby/pull/12") {
+		t.Errorf("expected yank toast containing PR URL, got %q", yankToast)
+	}
+
+	// 6. Request Copilot review with 'p' on PR #12
+	_, cmdCopilot := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if cmdCopilot == nil {
+		t.Fatalf("expected copilot cmd with 'p'")
+	}
+
+	// 7. Create review task with 't' on PR #12
+	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m = updated.(Model)
+	if m.ActiveModal != ModalCreatePRTask {
+		t.Fatalf("expected ModalCreatePRTask after 't', got %v", m.ActiveModal)
+	}
+	if m.PRTaskTarget.Number != 12 {
+		t.Fatalf("expected PRTaskTarget #12, got #%d", m.PRTaskTarget.Number)
+	}
+}
+
+func TestTopLevelTabs_WithoutPRTab(t *testing.T) {
+	m := Model{
+		ActiveTab:       TabRepos,
+		SplashDismissed: true,
+		Width:           140,
+		Height:          30,
+	}
+
+	// 1. Render Top Bar and verify exactly 5 tabs, no PR tab
+	topBar := m.renderTopBar()
+	if strings.Contains(topBar, "Pull Requests") || strings.Contains(topBar, "2: PRs") {
+		t.Errorf("expected top bar NOT to contain PR tab, got:\n%s", topBar)
+	}
+	if !strings.Contains(topBar, "1: Repositories") || !strings.Contains(topBar, "2: Tasks") || !strings.Contains(topBar, "3: Squad Activity") {
+		t.Errorf("expected top bar to have Repos, Tasks, Squad Activity, got:\n%s", topBar)
+	}
+
+	// 2. Test numeric tab navigation: '1'=Repos, '2'=Tasks, '3'=Squad, '4'=Search, '5'=Status
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	if m.ActiveTab != TabTasks {
+		t.Errorf("expected ActiveTab=TabTasks on '2', got %v", m.ActiveTab)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(Model)
+	if m.ActiveTab != TabSquad {
+		t.Errorf("expected ActiveTab=TabSquad on '3', got %v", m.ActiveTab)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}})
+	m = updated.(Model)
+	if m.ActiveTab != TabSearch {
+		t.Errorf("expected ActiveTab=TabSearch on '4', got %v", m.ActiveTab)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(Model)
+	if m.ActiveTab != TabStatus {
+		t.Errorf("expected ActiveTab=TabStatus on '5', got %v", m.ActiveTab)
+	}
+
+	// 3. Test Tab cycling (modulo 5)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.ActiveTab != TabRepos {
+		t.Errorf("expected TabRepos after cycling from 5, got %v", m.ActiveTab)
 	}
 }
 

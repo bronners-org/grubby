@@ -296,7 +296,13 @@ func (m Model) getDisplayRepos() []github.Repository {
 		result = append(result, r)
 	}
 
-	if m.RepoSortVulnerabilities {
+	effectiveSortMode := m.RepoSortMode
+	if effectiveSortMode == RepoSortDefault && m.RepoSortVulnerabilities {
+		effectiveSortMode = RepoSortVulns
+	}
+
+	switch effectiveSortMode {
+	case RepoSortVulns:
 		type vulnSortKey struct {
 			total     int
 			critical  int
@@ -334,7 +340,60 @@ func (m Model) getDisplayRepos() []github.Repository {
 			}
 			return kA.lowerName < kB.lowerName
 		})
-	} else {
+
+	case RepoSortPRs:
+		type prSortKey struct {
+			prCount     int
+			lastUpdated time.Time
+			lowerName   string
+		}
+		keys := make(map[string]prSortKey, len(result))
+		for _, r := range result {
+			prs := m.getPRsForRepo(&r)
+			keys[r.Name] = prSortKey{
+				prCount:     len(prs),
+				lastUpdated: r.LastUpdated(),
+				lowerName:   strings.ToLower(r.Name),
+			}
+		}
+
+		sort.SliceStable(result, func(i, j int) bool {
+			kA := keys[result[i].Name]
+			kB := keys[result[j].Name]
+
+			if kA.prCount != kB.prCount {
+				return kA.prCount > kB.prCount
+			}
+			if !kA.lastUpdated.Equal(kB.lastUpdated) {
+				return kA.lastUpdated.After(kB.lastUpdated)
+			}
+			return kA.lowerName < kB.lowerName
+		})
+
+	case RepoSortLastUpdated:
+		type lastUpdatedSortKey struct {
+			lastUpdated time.Time
+			lowerName   string
+		}
+		keys := make(map[string]lastUpdatedSortKey, len(result))
+		for _, r := range result {
+			keys[r.Name] = lastUpdatedSortKey{
+				lastUpdated: r.LastUpdated(),
+				lowerName:   strings.ToLower(r.Name),
+			}
+		}
+
+		sort.SliceStable(result, func(i, j int) bool {
+			kA := keys[result[i].Name]
+			kB := keys[result[j].Name]
+
+			if !kA.lastUpdated.Equal(kB.lastUpdated) {
+				return kA.lastUpdated.After(kB.lastUpdated)
+			}
+			return kA.lowerName < kB.lowerName
+		})
+
+	default:
 		tmuxSessions := m.TmuxSessions
 		if tmuxSessions == nil {
 			tmuxSessions = GetTmuxSessions()
@@ -461,6 +520,58 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Filtered repos owned by squad '%s'", squadName)) }
 				}
 				return m, func() tea.Msg { return StatusToastMsg("Cleared squad repo filter") }
+			default:
+				return m, nil
+			}
+
+		case RepoLeaderSort:
+			switch msg.String() {
+			case "v":
+				if m.RepoSortMode == RepoSortVulns {
+					m.RepoSortMode = RepoSortDefault
+					m.RepoSortVulnerabilities = false
+					m.RepoCursor = m.firstSelectableRepoIndex()
+					return m, func() tea.Msg { return StatusToastMsg("Reset repository sort order to default") }
+				}
+				m.RepoSortMode = RepoSortVulns
+				m.RepoSortVulnerabilities = true
+				m.RepoCursor = m.firstSelectableRepoIndex()
+				return m, func() tea.Msg { return StatusToastMsg("Sorted repositories by vulnerabilities (most to least)") }
+			case "p":
+				if m.RepoSortMode == RepoSortPRs {
+					m.RepoSortMode = RepoSortDefault
+					m.RepoSortVulnerabilities = false
+					m.RepoCursor = m.firstSelectableRepoIndex()
+					return m, func() tea.Msg { return StatusToastMsg("Reset repository sort order to default") }
+				}
+				m.RepoSortMode = RepoSortPRs
+				m.RepoSortVulnerabilities = false
+				if m.ExpandedRepoPRs == nil {
+					m.ExpandedRepoPRs = make(map[string]bool)
+				}
+				for i := range m.Repos {
+					r := &m.Repos[i]
+					if len(m.getPRsForRepo(r)) > 0 {
+						key := strings.ToLower(r.Name)
+						if r.FullName != "" {
+							key = strings.ToLower(r.FullName)
+						}
+						m.ExpandedRepoPRs[key] = true
+					}
+				}
+				m.RepoCursor = m.firstSelectableRepoIndex()
+				return m, func() tea.Msg { return StatusToastMsg("Sorted repositories by open pull requests (most to least)") }
+			case "l":
+				if m.RepoSortMode == RepoSortLastUpdated {
+					m.RepoSortMode = RepoSortDefault
+					m.RepoSortVulnerabilities = false
+					m.RepoCursor = m.firstSelectableRepoIndex()
+					return m, func() tea.Msg { return StatusToastMsg("Reset repository sort order to default") }
+				}
+				m.RepoSortMode = RepoSortLastUpdated
+				m.RepoSortVulnerabilities = false
+				m.RepoCursor = m.firstSelectableRepoIndex()
+				return m, func() tea.Msg { return StatusToastMsg("Sorted repositories by last updated (newest to oldest)") }
 			default:
 				return m, nil
 			}
@@ -594,7 +705,15 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	items := m.getRepoTableItems()
 
 	switch msg.String() {
-	case "up", "k":
+	case "up":
+		if m.RepoCursor > 0 {
+			m.RepoCursor--
+		}
+		return m, nil
+	case "k":
+		if len(items) > 0 && m.RepoCursor >= 0 && m.RepoCursor < len(items) && items[m.RepoCursor].Kind == ItemRepoPR {
+			break // Fall through to ItemRepoPR handler for chec[k]out branch!
+		}
 		if m.RepoCursor > 0 {
 			m.RepoCursor--
 		}
@@ -638,6 +757,10 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "f":
 		m.RepoLeaderMode = RepoLeaderFilter
 		return m, nil
+	case "S":
+		// 'S' (Shift-S): Sort leader key: [v] vulnerabilities, [p] pull requests, [l] last updated
+		m.RepoLeaderMode = RepoLeaderSort
+		return m, nil
 	case "/":
 		// '/' filter: filter repositories by name or label
 		m.ActiveModal = ModalFilterRepoName
@@ -651,32 +774,22 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "v":
 		// 'v' sort by vulnerabilities: toggle sorting from most to least vulnerabilities
-		m.RepoSortVulnerabilities = !m.RepoSortVulnerabilities
+		if m.RepoSortMode == RepoSortVulns || m.RepoSortVulnerabilities {
+			m.RepoSortMode = RepoSortDefault
+			m.RepoSortVulnerabilities = false
+			m.RepoCursor = m.firstSelectableRepoIndex()
+			return m, func() tea.Msg { return StatusToastMsg("Reset repository sort order to default") }
+		}
+		m.RepoSortMode = RepoSortVulns
+		m.RepoSortVulnerabilities = true
 		m.RepoCursor = m.firstSelectableRepoIndex()
-		if m.RepoSortVulnerabilities {
-			return m, func() tea.Msg { return StatusToastMsg("Sorted repositories by vulnerabilities (most to least)") }
-		}
-		return m, func() tea.Msg { return StatusToastMsg("Reset repository sort order to default") }
-	case "S":
-		// 'S' (Shift-S): filter out all repositories not owned by the active squad
-		if m.Config == nil || m.Config.ActiveSquad == "" {
-			return m, func() tea.Msg { return StatusToastMsg("No active squad selected") }
-		}
-		m.SquadFilterActive = !m.SquadFilterActive
-		m.RepoCursor = m.firstSelectableRepoIndex()
-		if m.SquadFilterActive {
-			squadName := m.Config.ActiveSquad
-			if s := m.Config.GetActiveSquad(); s != nil && s.DisplayName != "" {
-				squadName = s.DisplayName
-			}
-			return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Filtered repos owned by squad '%s'", squadName)) }
-		}
-		return m, func() tea.Msg { return StatusToastMsg("Cleared squad repo filter") }
+		return m, func() tea.Msg { return StatusToastMsg("Sorted repositories by vulnerabilities (most to least)") }
 	case "esc":
 		// 'esc' clears active filters and sorting
-		if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortVulnerabilities || m.SquadFilterActive {
+		if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortMode != RepoSortDefault || m.RepoSortVulnerabilities || m.SquadFilterActive {
 			m.RepoFilter = ""
 			m.RepoGroupFilter = ""
+			m.RepoSortMode = RepoSortDefault
 			m.RepoSortVulnerabilities = false
 			m.SquadFilterActive = false
 			m.RepoCursor = m.firstSelectableRepoIndex()
@@ -753,6 +866,8 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.RepoCursor = len(newItems) - 1
 			}
 			return m, func() tea.Msg { return StatusToastMsg("Collapsed all repository tiers") }
+		case "s":
+			return m, func() tea.Msg { return StatusToastMsg("Select a repository to open session") }
 		default:
 			return m, nil
 		}
@@ -778,6 +893,24 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "m":
+			// Merge approved pull request directly
+			revStatus := strings.ToUpper(strings.TrimSpace(pr.ReviewDecision))
+			if revStatus != "APPROVED" {
+				if revStatus == "" {
+					revStatus = "PENDING"
+				}
+				return m, func() tea.Msg {
+					return StatusToastMsg(fmt.Sprintf("Cannot merge PR #%d: review status is %s (requires APPROVED)", pr.Number, revStatus))
+				}
+			}
+
+			repoName := pr.Repo
+			if repoName == "" && parentRepo != nil {
+				repoName = parentRepo.Name
+			}
+			m = m.recordRepoInteraction(repoName)
+			return m, m.mergePRCmd(repoName, pr.Number)
 		case "h", "left", "[":
 			// Jump cursor to parent repo row
 			items := m.getRepoTableItems()
@@ -820,8 +953,8 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				return StatusToastMsg(fmt.Sprintf("Requested Copilot review for #%d in %s", pr.Number, repoName))
 			}
-		case "c":
-			// Checkout branch locally if cloned
+		case "k", "c":
+			// Checkout PR branch locally
 			if parentRepo != nil {
 				st := m.GitStatuses[parentRepo.Name]
 				if !st.IsCloned {
@@ -838,6 +971,23 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "s":
+			// Top-level [s]ession for parent repo
+			if parentRepo != nil {
+				st := m.GitStatuses[parentRepo.Name]
+				if st.IsCloned {
+					msgStr, err := GoToRepoSession(parentRepo.Name, st.LocalPath)
+					if err != nil {
+						return m, func() tea.Msg { return StatusToastMsg("Failed to switch session: " + err.Error()) }
+					}
+					return m, tea.Batch(
+						func() tea.Msg { return StatusToastMsg(msgStr) },
+						m.fetchSingleRepoCmd(m.CurrentOrg, parentRepo.Name),
+					)
+				}
+				return m.startCloneWithAction(*parentRepo, RepoActionSession)
+			}
+			return m, nil
 		default:
 			return m, nil
 		}
@@ -847,6 +997,20 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	repo := *currentItem.Repo
 
 	switch msg.String() {
+	case "s":
+		// Top-level [s]ession command
+		st := m.GitStatuses[repo.Name]
+		if st.IsCloned {
+			msgStr, err := GoToRepoSession(repo.Name, st.LocalPath)
+			if err != nil {
+				return m, func() tea.Msg { return StatusToastMsg("Failed to switch session: " + err.Error()) }
+			}
+			return m, tea.Batch(
+				func() tea.Msg { return StatusToastMsg(msgStr) },
+				m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
+			)
+		}
+		return m.startCloneWithAction(repo, RepoActionSession)
 	case "o":
 		m.RepoLeaderMode = RepoLeaderOpen
 		return m, nil
@@ -1078,8 +1242,17 @@ func (m Model) renderReposView() string {
 	if m.RepoFilter != "" {
 		filterBadges = append(filterBadges, lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(fmt.Sprintf("Name: %q", m.RepoFilter)))
 	}
-	if m.RepoSortVulnerabilities {
+	effectiveSortMode := m.RepoSortMode
+	if effectiveSortMode == RepoSortDefault && m.RepoSortVulnerabilities {
+		effectiveSortMode = RepoSortVulns
+	}
+	switch effectiveSortMode {
+	case RepoSortVulns:
 		filterBadges = append(filterBadges, lipgloss.NewStyle().Foreground(WarningColor).Bold(true).Render("Sort: 🛡️ Most Vulns ↓"))
+	case RepoSortPRs:
+		filterBadges = append(filterBadges, lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render("Sort: ⑂ Open PRs ↓"))
+	case RepoSortLastUpdated:
+		filterBadges = append(filterBadges, lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render("Sort: 🕒 Last Updated ↓"))
 	}
 
 	hotCount, warmCount, coldCount, deadCount, hiddenCount := m.getRepoTierCounts()

@@ -30,13 +30,13 @@ type TabType int
 
 const (
 	TabRepos TabType = iota
-	TabPRs
 	TabTasks
 	TabSquad
 	TabSearch
 	TabStatus
 
 	// Backward compatibility aliases
+	TabPRs        = TabRepos
 	TabMyTasks    = TabTasks
 	TabSquadTasks = TabTasks
 )
@@ -56,6 +56,16 @@ const (
 	RepoLeaderFilter // triggered by 'f' -> wait for 'n' (name), 'l' (label), 's' (squad)
 	RepoLeaderOpen   // triggered by 'o' -> wait for 'w'/'c' (web), 'e' (editor), 's' (session), 'p' (PRs), 'i' (issues), 'a' (actions), 'd' (security), 'r' (releases), 'n' (pulse)
 	RepoLeaderYank   // triggered by 'y' -> same options as Open except 'e'
+	RepoLeaderSort   // triggered by 'S' -> wait for 'v' (vulnerabilities), 'p' (pull requests), 'l' (last updated)
+)
+
+type RepoSortMode int
+
+const (
+	RepoSortDefault RepoSortMode = iota
+	RepoSortVulns
+	RepoSortPRs
+	RepoSortLastUpdated
 )
 
 type ModalType int
@@ -283,6 +293,7 @@ type Model struct {
 	RepoGroupFilter         string
 	SquadFilterActive       bool
 	RepoSortVulnerabilities bool
+	RepoSortMode            RepoSortMode
 	RepoFilterInput         textinput.Model
 	TmuxSessions            map[string]TmuxSessionInfo
 
@@ -2023,28 +2034,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ActiveTab = TabRepos
 			return m, nil
 		case "2":
-			m.ActiveTab = TabPRs
-			return m, nil
-		case "3":
 			m.ActiveTab = TabTasks
 			return m, nil
-		case "4":
+		case "3":
 			m.ActiveTab = TabSquad
 			return m, m.emitSquadMemberAvatarsCmd()
-		case "5":
+		case "4":
 			m.ActiveTab = TabSearch
 			return m, nil
-		case "6", "7":
+		case "5", "6", "7":
 			m.ActiveTab = TabStatus
 			return m, nil
 		case "tab":
-			m.ActiveTab = (m.ActiveTab + 1) % 6
+			m.ActiveTab = (m.ActiveTab + 1) % 5
 			if m.ActiveTab == TabSquad {
 				return m, m.emitSquadMemberAvatarsCmd()
 			}
 			return m, nil
 		case "shift+tab":
-			m.ActiveTab = (m.ActiveTab + 5) % 6
+			m.ActiveTab = (m.ActiveTab + 4) % 5
 			if m.ActiveTab == TabSquad {
 				return m, m.emitSquadMemberAvatarsCmd()
 			}
@@ -2065,8 +2073,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.ActiveTab {
 		case TabRepos:
 			return m.handleReposKeys(msg)
-		case TabPRs:
-			return m.handlePRsKeys(msg)
 		case TabTasks:
 			return m.handleTasksKeys(msg)
 		case TabSquad:
@@ -2107,8 +2113,6 @@ func (m Model) View() string {
 	switch m.ActiveTab {
 	case TabRepos:
 		body = m.renderReposView()
-	case TabPRs:
-		body = m.renderPRsView()
 	case TabTasks:
 		body = m.renderTasksView()
 	case TabSquad:
@@ -2166,35 +2170,29 @@ func (m Model) renderTopBar() string {
 	totalTasks := mineOpen + squadOpen
 
 	var tabs []string
-	if m.Width >= 135 {
+	if m.Width >= 120 {
 		tabs = []string{
 			"1: Repositories",
-			fmt.Sprintf("2: Pull Requests (%d)", len(m.PRs)),
-			fmt.Sprintf("3: Tasks (%d)", totalTasks),
-			"4: Squad Activity",
-			"5: Code Search",
-			fmt.Sprintf("6: Status %s", statusDot),
+			fmt.Sprintf("2: Tasks (%d)", totalTasks),
+			"3: Squad Activity",
+			"4: Code Search",
+			fmt.Sprintf("5: Status %s", statusDot),
 		}
-	} else if m.Width >= 105 {
-		prCountStr := ""
-		if len(m.PRs) > 0 {
-			prCountStr = fmt.Sprintf(" (%d)", len(m.PRs))
-		}
+	} else if m.Width >= 95 {
 		tasksCountStr := ""
 		if totalTasks > 0 {
 			tasksCountStr = fmt.Sprintf(" (%d)", totalTasks)
 		}
 		tabs = []string{
 			"1: Repos",
-			fmt.Sprintf("2: PRs%s", prCountStr),
-			fmt.Sprintf("3: Tasks%s", tasksCountStr),
-			"4: Squad",
-			"5: Search",
-			fmt.Sprintf("6: Status %s", statusDot),
+			fmt.Sprintf("2: Tasks%s", tasksCountStr),
+			"3: Squad",
+			"4: Search",
+			fmt.Sprintf("5: Status %s", statusDot),
 		}
 	} else {
 		tabs = []string{
-			"1: Repos", "2: PRs", "3: Tasks", "4: Squad", "5: Search", fmt.Sprintf("6: %s", statusDot),
+			"1: Repos", "2: Tasks", "3: Squad", "4: Search", fmt.Sprintf("5: %s", statusDot),
 		}
 	}
 
@@ -2338,6 +2336,8 @@ func (m Model) renderFooter() string {
 			help = "Open: [w/c] Web  [e] Editor  [s] Session  [p] PRs  [i] Issues  [a] Actions  [d] Security  [r] Releases  [Esc] Cancel"
 		} else if m.RepoLeaderMode == RepoLeaderYank {
 			help = "Yank: [w/c] Web URL  [s] Session  [p] PRs URL  [i] Issues URL  [a] Actions URL  [d] Security URL  [r] Releases URL  [Esc] Cancel"
+		} else if m.RepoLeaderMode == RepoLeaderSort {
+			help = "Sort: [v] Vulnerabilities  [p] Pull Requests  [l] Last Updated  [Esc] Cancel"
 		} else {
 			items := m.getRepoTableItems()
 			isTierHeader := false
@@ -2350,18 +2350,12 @@ func (m Model) renderFooter() string {
 			if isTierHeader {
 				help = "[Space/Enter] Toggle Tier  [Left/h] Collapse  [Right/l] Expand  [Z] Collapse All  [E] Expand All  [j/k] Navigate  [?] Help"
 			} else if isPRItem {
-				help = "[Enter/o] Open PR  [y] Yank PR URL  [Left/h] Parent Repo  [C] Claim  [j/k] Navigate  [?] Help"
-			} else if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortVulnerabilities || m.SquadFilterActive {
-				help = "[Enter] Toggle PRs  [f] Filter (n/l/s)  [o] Open (w/e/s/p/i)  [y] Yank  [C] Claim  [c] Clone  [l] Label  [Esc] Clear  [?] Help"
+				help = "[Enter/o] Open PR  [m] Merge  [p] Copilot  [k/c] Checkout  [s] Session  [t] Task  [y] Yank  [Left/h] Parent  [C] Claim  [?] Help"
+			} else if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortMode != RepoSortDefault || m.RepoSortVulnerabilities || m.SquadFilterActive {
+				help = "[Enter] Toggle PRs  [s] Session  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [Esc] Clear  [?] Help"
 			} else {
-				help = "[Enter] Toggle PRs  [f] Filter (n/l/s)  [o] Open (w/e/s/p/i)  [y] Yank  [C] Claim  [c] Clone  [l] Label  [v] Vulns  [?] Help"
+				help = "[Enter] Toggle PRs  [s] Session  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [?] Help"
 			}
-		}
-	case TabPRs:
-		if m.PRFilter != "" {
-			help = "[m] Merge  [f] Filter  [Esc] Clear Filter  [t] Request Review  [y] Yank URL  [o] Browser  [p] Copilot Review  [c] Checkout Branch  [?] Help"
-		} else {
-			help = "[m] Merge  [f] Filter  [t] Request Review  [y] Yank URL  [o] Browser  [p] Copilot Review  [c] Checkout Branch  [r] Refresh  [?] Help"
 		}
 	case TabTasks:
 		if m.TaskLeaderMode == TaskLeaderCreate {

@@ -12,31 +12,43 @@ It merges **remote GitHub state** (pull requests, unresolved review threads, tea
 
 ## Features
 
-### 1. Repositories Cockpit
+### 1. Repositories Cockpit & Consolidated Pull Requests
 * **Workspace Status Awareness**: Scans your local workspace folder (default `~/workspaces/*`) and classifies branches non-destructively: `[✓ synced]`, `[↓ behind]`, `[↑ ahead]`, `[* dirty]`, or `[Not Cloned]`. When a repository is cloned via `c`, Grubby immediately detects the clone and reflects its git status and local path without requiring a manual refresh.
-* **Dynamic Multi-Group Tagging**: Press `g` to assign repositories to one or more groups (e.g., `backend`, `payments`, `core-services`). Group definitions are persisted immediately to `~/.config/grubby/config.yaml`.
-* **Filtering & Sorting**:
-  * `v` (**View by Group**): Filter the repository table by any defined group, or show all.
-  * `f` (**Filter by Name**): Real-time substring filter on repository name.
-  * `s` (**Sort by Vulnerabilities**): Toggle sorting from highest vulnerability count to lowest.
-  * `Esc`: Instantly clear active group, name filters, and custom sorting.
+* **Top-Level Session Switcher (`s`)**: Press `s` at the top level on any repository or pull request row to instantly jump into or spawn its dedicated tmux session.
+* **Sorting Leader (`S`)**:
+  * `S` → `v`: Sort by vulnerabilities (most to least).
+  * `S` → `p`: Sort by open pull requests (most to least) and auto-expand repositories with open PRs.
+  * `S` → `l`: Sort by last updated / pushed timestamp.
+  * `Esc`: Instantly reset to default tier-grouped sort order.
+* **Filtering Leader (`f`)**:
+  * `f` → `n`: Real-time substring filter on repository name.
+  * `f` → `l`: Filter repositories by defined group / label.
+  * `f` → `s`: Toggle squad ownership filter.
+* **Inline Pull Request Tree & Actions**:
+  * `Enter` / `Space` expands or collapses open pull requests under any repository.
+  * **When a Pull Request row is selected**:
+    * `m`: Merge approved pull requests directly (requires `APPROVED`).
+    * `p`: Trigger GitHub Copilot PR code review.
+    * `k` or `c`: Checkout PR branch into local workspace.
+    * `s`: Launch dedicated tmux session for the repository.
+    * `t`: Create review task for squad or member in Tasks.
+    * `Enter` / `o`: Open pull request in browser.
+    * `y`: Copy pull request URL to clipboard.
+    * `Left` / `h`: Jump back to parent repository row.
 * **Developer Ergonomics**:
-  * `c` clones uncloned repositories into `~/workspaces/{repo}` using `gh repo clone` and updates status in real time.
-  * `e` launches the local repository directly in your `$EDITOR` (Neovim in iTerm2, VS Code, etc.).
-  * `t` opens a dedicated shell tab in iTerm2 at the repository root.
-  * `u` safely fast-forwards clean `behind` repositories (`git merge --ff-only`).
-  * `o` opens the repository submenu with direct links to GitHub tabs (Code, PRs, Issues, Actions, Security, Releases, etc.).
-  * `S` opens the Dependabot security advisory page in your browser.
+  * `c` clones uncloned repositories into `~/workspaces/{repo}` using `gh repo clone`.
+  * `o` in-place leader key to open GitHub tabs (Web overview, Editor, Session, PRs, Issues, Actions, Security, Releases, Settings).
+  * `y` yank leader key to copy URLs / session name to clipboard.
+  * `C` claims or toggles repository ownership for the active squad.
+  * `l` opens the Labels modal to manage repository tags.
 
-### 2. Pull Request Dashboard
-* **Actionable Focus**: Prioritizes open pull requests across your active organization or squad with fixed, pinned table headers and smooth scrolling even on large tables (50+ PRs).
-* **Real-Time PR Filter**: Press `f` to filter open PRs across the organization by title, repository, or author. Press `Esc` to instantly clear the filter.
-* **Large Table Navigation**: Smooth scrolling with `PgDown` / `PgUp` (or `Ctrl+D` / `Ctrl+U`), and quick jump to top (`Home` / `g`) or bottom (`End` / `G`).
-* **Staleness Indicator**: Pull requests inactive for >3 days are flagged with a prominent warning badge `[!]`.
-* **Unresolved Comments Counter**: Instant visibility into review progress (`💬 {unresolved}/{total}`).
-* **Review States**: Clear color-coded badges for `APPROVED`, `CHANGES_REQ`, and `REVIEW_REQ`.
-* **Copilot Review**: Press `p` to automatically request a GitHub Copilot code review.
-* **Local Branch Checkout**: Press `c` to checkout the PR branch into your local workspace.
+### 2. Consolidated Tasks Dashboard
+* **Unified Workspace & Squad Tasks**: Displays your personal tasks (backed by your personal repository) alongside squad tasks (backed by the home organization `grubby-tasks`).
+* **Ergonomic Leader Keys**:
+  * `a` (Add Task leader): prompts for `[m]y task` or `[s]quad task` inline creation.
+  * `g` (Go to Task leader): overlays visible numeric labels on tasks for instant jump navigation (`[g]` → `[#]` + `Enter`), with `[f]irst` and `[l]ast` shortcuts.
+* **Smart Section Collapsing**: Completed tasks are collapsed by default and skipped during fast numeric jump navigation. Toggle completed section with `D`.
+* **Issue & PR Integration**: PR review tasks link directly to the underlying pull request (`Enter`/`o` opens the PR, `i` opens the issue).
 
 ### 3. Squad Activity Feed
 * **Watched Squad Focus**: Group squad members together and track what they are actively shipping across the organization (PR opens, merges, comments, commits).
