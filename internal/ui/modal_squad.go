@@ -530,26 +530,18 @@ Global Navigation:
   [q] / [Ctrl+C]      Quit
 
 Repositories Tab (1):
-  [j/k] or [↑/↓]      Select repository or tier header
-  [Space / Enter]     Toggle collapse / expand tier (on tier header)
-  [h / Left]          Collapse tier (or jump to parent tier header)
-  [l / Right]         Expand tier (on tier header)
-  [C] / [E]           Collapse all tiers / Expand all tiers
-  [p]                 View PRs for repository (switches to Tab 2 filtered by repo)
-  [/]                 Filter repositories by name or label
-  [#]                 Filter repositories by label
-  [v]                 Sort by vulnerabilities (toggle most to least)
-  [s]                 Switch to / open tmux session in Grubby window (auto-clones if needed)
-  [e]                 Open editor in new window in tmux session (auto-clones if needed)
-  [t]                 Open shell / new window in tmux session (auto-clones if needed)
-  [Esc]               Clear active filter and sorting
-  [Enter]             Open repo in dedicated browser (on repository row)
-  [o]                 Open GitHub Web Tabs Submenu (with [y] Yank URL leader)
-  [O]                 Assign / unassign repository ownership to active squad
-  [S]                 Filter repositories owned by active squad (toggle)
-  [l]                 Manage Labels (assign / create labels)
+  [j/k] or [↑/↓]      Select repository, PR, or tier header
+  [Space / Enter]     Toggle PR expansion (on repo) / Open PR (on PR row) / Toggle tier (on header)
+  [f]                 Filter leader: [n] Name, [l] Label, [s] Squad filter toggle
+  [o]                 Open leader: [w/c] Web, [e] Editor, [s] Session, [p] PRs, [i] Issues, [a] Actions, [d] Security, [r] Releases, [n] Pulse
+  [y]                 Yank leader: [w/c] Web URL, [s] Session, [p] PRs URL, [i] Issues URL, [a] Actions URL, [d] Security URL, [r] Releases URL
+  [C]                 Assign / unassign (Claim) repository ownership to active squad
   [c]                 Clone repo to ~/workspaces/
-  [u]                 Fast-forward clean behind repo
+  [l]                 Manage Labels (assign / create labels)
+  [v]                 Sort by vulnerabilities (toggle most to least)
+  [h / Left / []      Jump to parent repo (on PR) / Collapse PRs or tier
+  [l / Right / ]]     Expand PRs or tier
+  [Esc]               Clear active filters / Cancel leader mode
 
 Pull Requests Tab (2):
   [j/k] or [↑/↓]      Select pull request

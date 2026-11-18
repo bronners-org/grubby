@@ -617,3 +617,75 @@ func TestSquadDashboard_SecurityOverviewTable(t *testing.T) {
 	}
 }
 
+func TestSquadDashboard_ConsolidatedOpenPRsAndReviewsTable(t *testing.T) {
+	now := time.Now()
+	cfg := &config.Config{
+		ActiveSquad: "core",
+		Squads: []config.SquadConfig{
+			{
+				Name:        "core",
+				DisplayName: "Core Team",
+				Members:     []string{"alice", "bob"},
+				Repos:       []string{"auth-svc", "gateway-svc"},
+			},
+		},
+	}
+
+	prs := []github.PullRequest{
+		{
+			Number:         10,
+			Title:          "Add oauth provider",
+			Repo:           "auth-svc",
+			Author:         "alice",
+			UpdatedAt:      now.Add(-10 * time.Minute),
+			State:          "open",
+			ReviewDecision: "APPROVED",
+		},
+		{
+			Number:         11,
+			Title:          "Fix session timeout",
+			Repo:           "auth-svc",
+			Author:         "bob",
+			UpdatedAt:      now.Add(-5 * time.Minute),
+			State:          "open",
+			ReviewDecision: "CHANGES_REQUESTED",
+		},
+		{
+			Number:         5,
+			Title:          "Update rate limits",
+			Repo:           "gateway-svc",
+			Author:         "alice",
+			UpdatedAt:      now.Add(-1 * time.Hour),
+			State:          "open",
+			ReviewDecision: "REVIEW_REQUIRED",
+		},
+	}
+
+	m := Model{
+		Config: cfg,
+		Width:  140,
+		Height: 50,
+		PRs:    prs,
+	}
+
+	rendered := m.renderSquadView()
+
+	// 1. Table header exists
+	if !strings.Contains(rendered, "SQUAD REPOSITORIES OPEN PRS & REVIEWS") {
+		t.Fatalf("expected view to contain 'SQUAD REPOSITORIES OPEN PRS & REVIEWS' table, got:\n%s", rendered)
+	}
+
+	// 2. Both squad repos appear in table
+	if !strings.Contains(rendered, "auth-svc") || !strings.Contains(rendered, "gateway-svc") {
+		t.Fatalf("expected both auth-svc and gateway-svc in PR table, got:\n%s", rendered)
+	}
+
+	// 3. Verify columns and status badges are present (APPRV, WAIT, CHG/CMT, ✓, ⏳, 💬)
+	if !strings.Contains(rendered, "APPRV") || !strings.Contains(rendered, "WAIT") || !strings.Contains(rendered, "CHG/CMT") {
+		t.Fatalf("expected PR review column headers in PR table, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "✓ 1") || !strings.Contains(rendered, "⏳ 1") || !strings.Contains(rendered, "💬 1") {
+		t.Fatalf("expected review status indicators in PR table, got:\n%s", rendered)
+	}
+}
+

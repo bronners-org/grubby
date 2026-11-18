@@ -202,3 +202,120 @@ func TestConfigLoadAndSave(t *testing.T) {
 		t.Errorf("expected auth-service to be unassigned from security")
 	}
 }
+
+func TestConfigExists(t *testing.T) {
+	tmpDir := t.TempDir()
+	nonExistent := filepath.Join(tmpDir, "missing.yaml")
+	if Exists(nonExistent) {
+		t.Fatalf("expected Exists to return false for missing file")
+	}
+
+	existing := filepath.Join(tmpDir, "exists.yaml")
+	if err := os.WriteFile(existing, []byte("version: 1\n"), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+	if !Exists(existing) {
+		t.Fatalf("expected Exists to return true for existing file")
+	}
+}
+
+func TestSquadOrganizations(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	cfg.HomeOrg = "home-org"
+	cfg.DefaultOrg = "default-org"
+
+	err = cfg.CreateSquad("devops", "DevOps Squad", []string{"charlie"})
+	if err != nil {
+		t.Fatalf("failed to create squad: %v", err)
+	}
+
+	// 1. Initial orgs should be empty
+	orgs := cfg.GetOrgsForSquad("devops")
+	if len(orgs) != 0 {
+		t.Fatalf("expected 0 orgs initially, got %v", orgs)
+	}
+
+	// 2. AddOrgToSquad
+	err = cfg.AddOrgToSquad("devops", "org-alpha")
+	if err != nil {
+		t.Fatalf("failed to add org-alpha: %v", err)
+	}
+	err = cfg.AddOrgToSquad("devops", "org-beta")
+	if err != nil {
+		t.Fatalf("failed to add org-beta: %v", err)
+	}
+	// Adding duplicate org should be no-op / idempotent
+	err = cfg.AddOrgToSquad("devops", "org-alpha")
+	if err != nil {
+		t.Fatalf("failed to add duplicate org: %v", err)
+	}
+
+	orgs = cfg.GetOrgsForSquad("devops")
+	if len(orgs) != 2 || orgs[0] != "org-alpha" || orgs[1] != "org-beta" {
+		t.Fatalf("expected [org-alpha, org-beta], got %v", orgs)
+	}
+
+	// 3. RemoveOrgFromSquad
+	err = cfg.RemoveOrgFromSquad("devops", "org-alpha")
+	if err != nil {
+		t.Fatalf("failed to remove org-alpha: %v", err)
+	}
+	orgs = cfg.GetOrgsForSquad("devops")
+	if len(orgs) != 1 || orgs[0] != "org-beta" {
+		t.Fatalf("expected [org-beta], got %v", orgs)
+	}
+
+	// 4. SetSquadOrgs
+	err = cfg.SetSquadOrgs("devops", []string{"org-1", "org-2", "org-3"})
+	if err != nil {
+		t.Fatalf("failed to set squad orgs: %v", err)
+	}
+	orgs = cfg.GetOrgsForSquad("devops")
+	if len(orgs) != 3 {
+		t.Fatalf("expected 3 orgs after SetSquadOrgs, got %v", orgs)
+	}
+
+	// 5. GetActiveSquadOrgs
+	_ = cfg.SetActiveSquad("devops")
+	activeOrgs := cfg.GetActiveSquadOrgs()
+	if len(activeOrgs) != 3 || activeOrgs[0] != "org-1" {
+		t.Fatalf("expected [org-1, org-2, org-3], got %v", activeOrgs)
+	}
+
+	// 6. GetTrackedOrgs combines DefaultOrg, HomeOrg, and active squad orgs
+	tracked := cfg.GetTrackedOrgs()
+	// Should contain default-org, home-org, org-1, org-2, org-3
+	expectedTracked := map[string]bool{
+		"default-org": true,
+		"home-org":    true,
+		"org-1":       true,
+		"org-2":       true,
+		"org-3":       true,
+	}
+	for _, tr := range tracked {
+		if !expectedTracked[tr] {
+			t.Errorf("unexpected tracked org: %s", tr)
+		}
+		delete(expectedTracked, tr)
+	}
+	if len(expectedTracked) != 0 {
+		t.Errorf("missing tracked orgs: %v", expectedTracked)
+	}
+
+	// 7. Verify persistence across Load
+	reloaded, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to reload config: %v", err)
+	}
+	reloadedOrgs := reloaded.GetOrgsForSquad("devops")
+	if len(reloadedOrgs) != 3 || reloadedOrgs[0] != "org-1" {
+		t.Fatalf("expected 3 reloaded orgs, got %v", reloadedOrgs)
+	}
+}

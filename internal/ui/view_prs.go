@@ -21,6 +21,8 @@ func (m Model) getDisplayPRs() []github.PullRequest {
 	for _, pr := range m.PRs {
 		if strings.Contains(strings.ToLower(pr.Title), f) ||
 			strings.Contains(strings.ToLower(pr.Repo), f) ||
+			strings.Contains(strings.ToLower(pr.RepoFullName), f) ||
+			strings.Contains(strings.ToLower(pr.RepoOwner), f) ||
 			strings.Contains(strings.ToLower(pr.Author), f) {
 			result = append(result, pr)
 		}
@@ -221,6 +223,8 @@ func (m Model) renderPRsView() string {
 		bannerText = MetaBarStyle.Render(fmt.Sprintf("  ⑂ %d Open Pull Requests  ", len(m.PRs))) +
 			lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(fmt.Sprintf("🔍 Filter: %q (%d matched)", m.PRFilter, len(displayPRs))) +
 			MetaBarStyle.Render(" • [Esc] Clear")
+	} else if m.Config != nil && len(m.Config.TrackedOrgs) > 1 {
+		bannerText = MetaBarStyle.Render(fmt.Sprintf("  ⑂ %d Open Pull Requests across %d organizations  ", len(m.PRs), len(m.Config.TrackedOrgs)))
 	} else {
 		bannerText = MetaBarStyle.Render(fmt.Sprintf("  ⑂ %d Open Pull Requests across %s", len(m.PRs), m.CurrentOrg))
 	}
@@ -249,7 +253,7 @@ func (m Model) renderPRsView() string {
 	for i := start; i < end; i++ {
 		pr := displayPRs[i]
 
-		repoText := pr.Repo
+		repoText := pr.DisplayRepo()
 		if repoText == "" {
 			repoText = "-"
 		} else if len(repoText) > cols.RepoWidth-2 && cols.RepoWidth > 3 {
@@ -325,8 +329,15 @@ func (m Model) renderPRsView() string {
 			labelsText = labelsText[:cols.LabelsWidth-3] + "…"
 		}
 
+		isFlashing, flashBg := m.isEntityFlashing(fmt.Sprintf("pr:%s#%d", pr.DisplayRepo(), pr.Number))
+		if !isFlashing {
+			isFlashing, flashBg = m.isEntityFlashing(fmt.Sprintf("pr:%s#%d", pr.Repo, pr.Number))
+		}
+
 		prefix := "  "
-		if i == m.PRCursor {
+		if isFlashing {
+			prefix = "⚡ "
+		} else if i == m.PRCursor {
 			prefix = "▶ "
 		}
 
@@ -345,7 +356,13 @@ func (m Model) renderPRsView() string {
 		)
 
 		if i == m.PRCursor {
-			rows = append(rows, SelectedRowStyle.MaxHeight(1).Render(rowCells))
+			if isFlashing {
+				rows = append(rows, SelectedRowStyle.Background(flashBg).MaxHeight(1).Render(rowCells))
+			} else {
+				rows = append(rows, SelectedRowStyle.MaxHeight(1).Render(rowCells))
+			}
+		} else if isFlashing {
+			rows = append(rows, lipgloss.NewStyle().Background(flashBg).MaxHeight(1).Render(rowCells))
 		} else {
 			rows = append(rows, NormalRowStyle.MaxHeight(1).Render(rowCells))
 		}

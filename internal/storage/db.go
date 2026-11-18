@@ -90,9 +90,24 @@ func (d *DB) Close() error {
 
 func (d *DB) migrate() error {
 	schema := `
+	CREATE TABLE IF NOT EXISTS organizations (
+		login TEXT PRIMARY KEY,
+		is_home INTEGER NOT NULL DEFAULT 0,
+		name TEXT NOT NULL DEFAULT '',
+		avatar_url TEXT NOT NULL DEFAULT '',
+		last_synced_at DATETIME
+	);
+
+	CREATE TABLE IF NOT EXISTS processed_events (
+		delivery_id TEXT PRIMARY KEY,
+		event_type TEXT NOT NULL,
+		received_at DATETIME NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_processed_events_received ON processed_events (received_at);
+
 	CREATE TABLE IF NOT EXISTS repositories (
-		name TEXT PRIMARY KEY,
-		full_name TEXT NOT NULL,
+		full_name TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
 		owner TEXT NOT NULL,
 		description TEXT NOT NULL DEFAULT '',
 		pushed_at DATETIME NOT NULL,
@@ -104,8 +119,12 @@ func (d *DB) migrate() error {
 		last_interacted_at DATETIME,
 		tier TEXT NOT NULL DEFAULT 'warm',
 		is_hidden INTEGER NOT NULL DEFAULT 0,
+		is_home_org INTEGER NOT NULL DEFAULT 0,
 		last_synced_at DATETIME
 	);
+	CREATE INDEX IF NOT EXISTS idx_repositories_name ON repositories (name);
+	CREATE INDEX IF NOT EXISTS idx_repositories_owner ON repositories (owner);
+	CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories (tier);
 
 	CREATE TABLE IF NOT EXISTS pull_requests (
 		repo TEXT NOT NULL,
@@ -122,8 +141,12 @@ func (d *DB) migrate() error {
 		unresolved_comments INTEGER NOT NULL DEFAULT 0,
 		url TEXT NOT NULL DEFAULT '',
 		head_ref_name TEXT NOT NULL DEFAULT '',
+		repo_full_name TEXT NOT NULL DEFAULT '',
+		repo_owner TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (repo, number)
 	);
+	CREATE INDEX IF NOT EXISTS idx_prs_repo_full_name ON pull_requests (repo_full_name);
+	CREATE INDEX IF NOT EXISTS idx_prs_repo_owner ON pull_requests (repo_owner);
 
 	CREATE TABLE IF NOT EXISTS tasks (
 		id INTEGER PRIMARY KEY,
@@ -142,7 +165,8 @@ func (d *DB) migrate() error {
 		closed_at DATETIME,
 		url TEXT NOT NULL DEFAULT '',
 		is_squad_task INTEGER NOT NULL DEFAULT 0,
-		sync_status TEXT NOT NULL DEFAULT 'synced'
+		sync_status TEXT NOT NULL DEFAULT 'synced',
+		is_home_repo INTEGER NOT NULL DEFAULT 1
 	);
 	CREATE INDEX IF NOT EXISTS idx_tasks_lookup ON tasks (repo_owner, repo_name, number);
 	CREATE INDEX IF NOT EXISTS idx_tasks_squad_state ON tasks (is_squad_task, state);
@@ -228,14 +252,77 @@ func (d *DB) migrate() error {
 	if _, err := d.db.Exec(schema); err != nil {
 		return err
 	}
-	// Migrate existing database if is_hidden column is missing
+
+	// Migrate existing database columns if missing
 	_, _ = d.db.Exec(`ALTER TABLE repositories ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0;`)
+	_, _ = d.db.Exec(`ALTER TABLE repositories ADD COLUMN is_home_org INTEGER NOT NULL DEFAULT 0;`)
+	_, _ = d.db.Exec(`ALTER TABLE pull_requests ADD COLUMN repo_full_name TEXT NOT NULL DEFAULT '';`)
+	_, _ = d.db.Exec(`ALTER TABLE pull_requests ADD COLUMN repo_owner TEXT NOT NULL DEFAULT '';`)
+	_, _ = d.db.Exec(`ALTER TABLE tasks ADD COLUMN is_home_repo INTEGER NOT NULL DEFAULT 1;`)
+
+	// Check if repositories table has 'name' as PK instead of 'full_name'
+	var pkName string
+	rows, err := d.db.Query(`PRAGMA table_info(repositories)`)
+	if err == nil {
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, typ string
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err == nil && pk == 1 {
+				pkName = name
+			}
+		}
+		rows.Close()
+
+		if pkName == "name" {
+			// Migrate repositories table from (name PK) to (full_name PK)
+			migrateRepoPK := `
+				CREATE TABLE repositories_v2 (
+					full_name TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					owner TEXT NOT NULL,
+					description TEXT NOT NULL DEFAULT '',
+					pushed_at DATETIME NOT NULL,
+					updated_at DATETIME NOT NULL,
+					default_branch TEXT NOT NULL DEFAULT 'main',
+					is_private INTEGER NOT NULL DEFAULT 0,
+					url TEXT NOT NULL DEFAULT '',
+					ssh_url TEXT NOT NULL DEFAULT '',
+					last_interacted_at DATETIME,
+					tier TEXT NOT NULL DEFAULT 'warm',
+					is_hidden INTEGER NOT NULL DEFAULT 0,
+					is_home_org INTEGER NOT NULL DEFAULT 0,
+					last_synced_at DATETIME
+				);
+				INSERT OR IGNORE INTO repositories_v2 (
+					full_name, name, owner, description, pushed_at, updated_at,
+					default_branch, is_private, url, ssh_url, last_interacted_at,
+					tier, is_hidden, is_home_org, last_synced_at
+				) SELECT 
+					CASE WHEN full_name != '' THEN full_name ELSE (owner || '/' || name) END,
+					name, owner, description, pushed_at, updated_at,
+					default_branch, is_private, url, ssh_url, last_interacted_at,
+					tier, is_hidden, is_home_org, last_synced_at
+				FROM repositories;
+				DROP TABLE repositories;
+				ALTER TABLE repositories_v2 RENAME TO repositories;
+				CREATE INDEX IF NOT EXISTS idx_repositories_name ON repositories (name);
+				CREATE INDEX IF NOT EXISTS idx_repositories_owner ON repositories (owner);
+				CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories (tier);
+			`
+			_, _ = d.db.Exec(migrateRepoPK)
+		}
+	}
+
+	// Clean up any corrupt legacy repository rows where full_name does not match owner/name
+	_, _ = d.db.Exec(`DELETE FROM repositories WHERE full_name != owner || '/' || name`)
+
 	return nil
 }
 
 // --- Repositories ---
 
-func (d *DB) SaveRepositories(repos []github.Repository, owner string) error {
+func (d *DB) SaveRepositories(repos []github.Repository, owner string, isHome ...bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -247,11 +334,11 @@ func (d *DB) SaveRepositories(repos []github.Repository, owner string) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO repositories (
-			name, full_name, owner, description, pushed_at, updated_at,
-			default_branch, is_private, url, ssh_url, last_synced_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET
-			full_name=excluded.full_name,
+			full_name, name, owner, description, pushed_at, updated_at,
+			default_branch, is_private, url, ssh_url, is_home_org, last_synced_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(full_name) DO UPDATE SET
+			name=excluded.name,
 			owner=excluded.owner,
 			description=excluded.description,
 			pushed_at=excluded.pushed_at,
@@ -260,6 +347,7 @@ func (d *DB) SaveRepositories(repos []github.Repository, owner string) error {
 			is_private=excluded.is_private,
 			url=excluded.url,
 			ssh_url=excluded.ssh_url,
+			is_home_org=excluded.is_home_org,
 			last_synced_at=excluded.last_synced_at
 	`)
 	if err != nil {
@@ -273,18 +361,35 @@ func (d *DB) SaveRepositories(repos []github.Repository, owner string) error {
 		if r.IsPrivate {
 			isPriv = 1
 		}
-		repoOwner := owner
+		fullName := r.FullName
+		repoOwner := r.Owner
+		if repoOwner == "" && strings.Contains(fullName, "/") {
+			parts := strings.Split(fullName, "/")
+			repoOwner = parts[0]
+		}
 		if repoOwner == "" {
-			parts := strings.Split(r.FullName, "/")
-			if len(parts) > 0 {
-				repoOwner = parts[0]
+			repoOwner = owner
+		}
+
+		if fullName == "" {
+			if repoOwner != "" {
+				fullName = repoOwner + "/" + r.Name
+			} else {
+				fullName = r.Name
 			}
 		}
 
+		isHomeVal := 0
+		if len(isHome) > 0 && isHome[0] {
+			isHomeVal = 1
+		} else if r.IsHomeOrg {
+			isHomeVal = 1
+		}
+
 		_, err := stmt.Exec(
-			r.Name, r.FullName, repoOwner, r.Description,
+			fullName, r.Name, repoOwner, r.Description,
 			r.PushedAt.Format(time.RFC3339), r.UpdatedAt.Format(time.RFC3339),
-			r.DefaultBranch, isPriv, r.URL, r.SSHURL, now.Format(time.RFC3339),
+			r.DefaultBranch, isPriv, r.URL, r.SSHURL, isHomeVal, now.Format(time.RFC3339),
 		)
 		if err != nil {
 			return err
@@ -294,12 +399,59 @@ func (d *DB) SaveRepositories(repos []github.Repository, owner string) error {
 	return tx.Commit()
 }
 
+// PruneRepositoriesForOrgs removes repositories belonging to the specified orgs
+// that are not in the keepFullNames list, and purges any malformed records.
+func (d *DB) PruneRepositoriesForOrgs(orgs []string, keepFullNames []string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Clean up any malformed records where full_name does not match owner/name
+	_, _ = d.db.Exec(`DELETE FROM repositories WHERE full_name != owner || '/' || name`)
+
+	if len(orgs) == 0 {
+		return nil
+	}
+
+	orgPlaceholders := make([]string, len(orgs))
+	orgArgs := make([]interface{}, len(orgs))
+	for i, o := range orgs {
+		orgPlaceholders[i] = "LOWER(?)"
+		orgArgs[i] = strings.ToLower(strings.TrimSpace(o))
+	}
+
+	if len(keepFullNames) == 0 {
+		query := fmt.Sprintf("DELETE FROM repositories WHERE LOWER(owner) IN (%s)", strings.Join(orgPlaceholders, ","))
+		_, err := d.db.Exec(query, orgArgs...)
+		return err
+	}
+
+	keepPlaceholders := make([]string, len(keepFullNames))
+	keepArgs := make([]interface{}, len(keepFullNames))
+	for i, k := range keepFullNames {
+		keepPlaceholders[i] = "LOWER(?)"
+		keepArgs[i] = strings.ToLower(strings.TrimSpace(k))
+	}
+
+	args := append(orgArgs, keepArgs...)
+	query := fmt.Sprintf(
+		"DELETE FROM repositories WHERE LOWER(owner) IN (%s) AND LOWER(full_name) NOT IN (%s)",
+		strings.Join(orgPlaceholders, ","),
+		strings.Join(keepPlaceholders, ","),
+	)
+	_, err := d.db.Exec(query, args...)
+	return err
+}
+
+func (d *DB) SaveRepository(repo github.Repository, isHome ...bool) error {
+	return d.SaveRepositories([]github.Repository{repo}, repo.Owner, isHome...)
+}
+
 func (d *DB) GetRepositories() ([]github.Repository, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url
+		SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url, is_home_org, owner
 		FROM repositories
 		ORDER BY pushed_at DESC
 	`)
@@ -312,17 +464,18 @@ func (d *DB) GetRepositories() ([]github.Repository, error) {
 	for rows.Next() {
 		var r github.Repository
 		var pushedStr, updatedStr string
-		var isPriv int
+		var isPriv, isHomeInt int
 
 		err := rows.Scan(
 			&r.Name, &r.FullName, &r.Description,
 			&pushedStr, &updatedStr, &r.DefaultBranch,
-			&isPriv, &r.URL, &r.SSHURL,
+			&isPriv, &r.URL, &r.SSHURL, &isHomeInt, &r.Owner,
 		)
 		if err != nil {
 			return nil, err
 		}
 		r.IsPrivate = isPriv != 0
+		r.IsHomeOrg = isHomeInt != 0
 		r.PushedAt, _ = time.Parse(time.RFC3339, pushedStr)
 		r.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
 		repos = append(repos, r)
@@ -331,16 +484,136 @@ func (d *DB) GetRepositories() ([]github.Repository, error) {
 	return repos, nil
 }
 
+func (d *DB) GetRepositoriesByOrg(org string) ([]github.Repository, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`
+		SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url, is_home_org, owner
+		FROM repositories
+		WHERE owner = ? OR LOWER(owner) = LOWER(?)
+		ORDER BY pushed_at DESC
+	`, org, org)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var repos []github.Repository
+	for rows.Next() {
+		var r github.Repository
+		var pushedStr, updatedStr string
+		var isPriv, isHomeInt int
+
+		err := rows.Scan(
+			&r.Name, &r.FullName, &r.Description,
+			&pushedStr, &updatedStr, &r.DefaultBranch,
+			&isPriv, &r.URL, &r.SSHURL, &isHomeInt, &r.Owner,
+		)
+		if err != nil {
+			return nil, err
+		}
+		r.IsPrivate = isPriv != 0
+		r.IsHomeOrg = isHomeInt != 0
+		r.PushedAt, _ = time.Parse(time.RFC3339, pushedStr)
+		r.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
+		repos = append(repos, r)
+	}
+
+	return repos, nil
+}
+
+func (d *DB) GetRepoByName(fullNameOrName string) (*github.Repository, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	clean := strings.TrimSpace(fullNameOrName)
+	if clean == "" {
+		return nil, sql.ErrNoRows
+	}
+
+	var r github.Repository
+	var pushedStr, updatedStr string
+	var isPriv, isHomeInt int
+	var err error
+
+	if strings.Contains(clean, "/") {
+		err = d.db.QueryRow(`
+			SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url, is_home_org, owner
+			FROM repositories
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+			LIMIT 1
+		`, clean, clean).Scan(
+			&r.Name, &r.FullName, &r.Description,
+			&pushedStr, &updatedStr, &r.DefaultBranch,
+			&isPriv, &r.URL, &r.SSHURL, &isHomeInt, &r.Owner,
+		)
+	} else {
+		err = d.db.QueryRow(`
+			SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url, is_home_org, owner
+			FROM repositories
+			WHERE name = ? OR LOWER(name) = LOWER(?)
+			ORDER BY is_home_org DESC, pushed_at DESC
+			LIMIT 1
+		`, clean, clean).Scan(
+			&r.Name, &r.FullName, &r.Description,
+			&pushedStr, &updatedStr, &r.DefaultBranch,
+			&isPriv, &r.URL, &r.SSHURL, &isHomeInt, &r.Owner,
+		)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	r.IsPrivate = isPriv != 0
+	r.IsHomeOrg = isHomeInt != 0
+	r.PushedAt, _ = time.Parse(time.RFC3339, pushedStr)
+	r.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
+	return &r, nil
+}
+
+func (d *DB) DeleteRepository(fullNameOrName string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	clean := strings.TrimSpace(fullNameOrName)
+	if clean == "" {
+		return nil
+	}
+
+	if strings.Contains(clean, "/") {
+		_, err := d.db.Exec(`
+			DELETE FROM repositories
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+		`, clean, clean)
+		return err
+	}
+
+	_, err := d.db.Exec(`
+		DELETE FROM repositories
+		WHERE name = ? OR LOWER(name) = LOWER(?)
+	`, clean, clean)
+	return err
+}
+
 func (d *DB) TouchRepo(name string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	clean := strings.TrimSpace(name)
 	now := time.Now().Format(time.RFC3339)
+	if strings.Contains(clean, "/") {
+		_, err := d.db.Exec(`
+			UPDATE repositories SET last_interacted_at = ?
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+		`, now, clean, clean)
+		return err
+	}
+
 	_, err := d.db.Exec(`
-		UPDATE repositories
-		SET last_interacted_at = ?
+		UPDATE repositories SET last_interacted_at = ?
 		WHERE name = ? OR LOWER(name) = LOWER(?)
-	`, now, name, name)
+	`, now, clean, clean)
 	return err
 }
 
@@ -348,10 +621,23 @@ func (d *DB) GetRepoLastInteractedAt(name string) time.Time {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	clean := strings.TrimSpace(name)
 	var tStr sql.NullString
-	err := d.db.QueryRow(`
-		SELECT last_interacted_at FROM repositories WHERE name = ? OR LOWER(name) = LOWER(?)
-	`, name, name).Scan(&tStr)
+	var err error
+	if strings.Contains(clean, "/") {
+		err = d.db.QueryRow(`
+			SELECT last_interacted_at FROM repositories
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+			LIMIT 1
+		`, clean, clean).Scan(&tStr)
+	} else {
+		err = d.db.QueryRow(`
+			SELECT last_interacted_at FROM repositories
+			WHERE name = ? OR LOWER(name) = LOWER(?)
+			ORDER BY is_home_org DESC, pushed_at DESC
+			LIMIT 1
+		`, clean, clean).Scan(&tStr)
+	}
 	if err != nil || !tStr.Valid || tStr.String == "" {
 		return time.Time{}
 	}
@@ -364,17 +650,20 @@ func (d *DB) GetAllRepoInteractions() map[string]time.Time {
 	defer d.mu.RUnlock()
 
 	res := make(map[string]time.Time)
-	rows, err := d.db.Query(`SELECT name, last_interacted_at FROM repositories WHERE last_interacted_at IS NOT NULL`)
+	rows, err := d.db.Query(`SELECT name, full_name, last_interacted_at FROM repositories WHERE last_interacted_at IS NOT NULL`)
 	if err != nil {
 		return res
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var name, tStr string
-		if err := rows.Scan(&name, &tStr); err == nil && tStr != "" {
+		var name, fullName, tStr string
+		if err := rows.Scan(&name, &fullName, &tStr); err == nil && tStr != "" {
 			if t, err := time.Parse(time.RFC3339, tStr); err == nil {
 				res[strings.ToLower(name)] = t
+				if fullName != "" {
+					res[strings.ToLower(fullName)] = t
+				}
 			}
 		}
 	}
@@ -385,7 +674,19 @@ func (d *DB) SetRepoTier(name string, tier RepoTier) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.db.Exec(`UPDATE repositories SET tier = ? WHERE name = ? OR LOWER(name) = LOWER(?)`, string(tier), name, name)
+	clean := strings.TrimSpace(name)
+	if strings.Contains(clean, "/") {
+		_, err := d.db.Exec(`
+			UPDATE repositories SET tier = ?
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+		`, string(tier), clean, clean)
+		return err
+	}
+
+	_, err := d.db.Exec(`
+		UPDATE repositories SET tier = ?
+		WHERE name = ? OR LOWER(name) = LOWER(?)
+	`, string(tier), clean, clean)
 	return err
 }
 
@@ -396,15 +697,42 @@ func (d *DB) SetRepoHidden(name string, hidden bool) error {
 	if hidden {
 		val = 1
 	}
-	_, err := d.db.Exec(`UPDATE repositories SET is_hidden = ? WHERE name = ? OR LOWER(name) = LOWER(?)`, val, name, name)
+	clean := strings.TrimSpace(name)
+	if strings.Contains(clean, "/") {
+		_, err := d.db.Exec(`
+			UPDATE repositories SET is_hidden = ?
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+		`, val, clean, clean)
+		return err
+	}
+
+	_, err := d.db.Exec(`
+		UPDATE repositories SET is_hidden = ?
+		WHERE name = ? OR LOWER(name) = LOWER(?)
+	`, val, clean, clean)
 	return err
 }
 
 func (d *DB) IsRepoHidden(name string) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	clean := strings.TrimSpace(name)
 	var hidden int
-	err := d.db.QueryRow(`SELECT is_hidden FROM repositories WHERE name = ? OR LOWER(name) = LOWER(?)`, name, name).Scan(&hidden)
+	var err error
+	if strings.Contains(clean, "/") {
+		err = d.db.QueryRow(`
+			SELECT is_hidden FROM repositories
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+			LIMIT 1
+		`, clean, clean).Scan(&hidden)
+	} else {
+		err = d.db.QueryRow(`
+			SELECT is_hidden FROM repositories
+			WHERE name = ? OR LOWER(name) = LOWER(?)
+			ORDER BY is_home_org DESC, pushed_at DESC
+			LIMIT 1
+		`, clean, clean).Scan(&hidden)
+	}
 	if err != nil {
 		return false
 	}
@@ -414,16 +742,19 @@ func (d *DB) IsRepoHidden(name string) bool {
 func (d *DB) GetAllHiddenRepos() map[string]bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	rows, err := d.db.Query(`SELECT name FROM repositories WHERE is_hidden = 1`)
+	rows, err := d.db.Query(`SELECT name, full_name FROM repositories WHERE is_hidden = 1`)
 	if err != nil {
 		return make(map[string]bool)
 	}
 	defer rows.Close()
 	result := make(map[string]bool)
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err == nil {
+		var name, fullName string
+		if err := rows.Scan(&name, &fullName); err == nil {
 			result[strings.ToLower(name)] = true
+			if fullName != "" {
+				result[strings.ToLower(fullName)] = true
+			}
 		}
 	}
 	return result
@@ -433,8 +764,23 @@ func (d *DB) GetRepoTier(name string) RepoTier {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	clean := strings.TrimSpace(name)
 	var tierStr string
-	err := d.db.QueryRow(`SELECT tier FROM repositories WHERE name = ? OR LOWER(name) = LOWER(?)`, name, name).Scan(&tierStr)
+	var err error
+	if strings.Contains(clean, "/") {
+		err = d.db.QueryRow(`
+			SELECT tier FROM repositories
+			WHERE full_name = ? OR LOWER(full_name) = LOWER(?)
+			LIMIT 1
+		`, clean, clean).Scan(&tierStr)
+	} else {
+		err = d.db.QueryRow(`
+			SELECT tier FROM repositories
+			WHERE name = ? OR LOWER(name) = LOWER(?)
+			ORDER BY is_home_org DESC, pushed_at DESC
+			LIMIT 1
+		`, clean, clean).Scan(&tierStr)
+	}
 	if err != nil || tierStr == "" {
 		return TierWarm
 	}
@@ -457,26 +803,29 @@ func (d *DB) GetAllRepoTiers() map[string]RepoTier {
 	defer d.mu.RUnlock()
 
 	res := make(map[string]RepoTier)
-	rows, err := d.db.Query(`SELECT name, tier FROM repositories`)
+	rows, err := d.db.Query(`SELECT name, full_name, tier FROM repositories`)
 	if err != nil {
 		return res
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var name, tier string
-		if err := rows.Scan(&name, &tier); err == nil && tier != "" {
+		var name, fullName, tier string
+		if err := rows.Scan(&name, &fullName, &tier); err == nil && tier != "" {
+			t := RepoTier(tier)
 			switch strings.ToLower(tier) {
 			case "hot":
-				res[strings.ToLower(name)] = TierHot
+				t = TierHot
 			case "warm", "active":
-				res[strings.ToLower(name)] = TierWarm
+				t = TierWarm
 			case "cold", "dormant":
-				res[strings.ToLower(name)] = TierCold
+				t = TierCold
 			case "dead":
-				res[strings.ToLower(name)] = TierDead
-			default:
-				res[strings.ToLower(name)] = RepoTier(tier)
+				t = TierDead
+			}
+			res[strings.ToLower(name)] = t
+			if fullName != "" {
+				res[strings.ToLower(fullName)] = t
 			}
 		}
 	}
@@ -488,7 +837,7 @@ func (d *DB) GetHotAndWarmRepos() ([]github.Repository, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url
+		SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url, is_home_org, owner
 		FROM repositories
 		WHERE tier IN ('hot', 'warm', 'active')
 		ORDER BY pushed_at DESC
@@ -502,17 +851,18 @@ func (d *DB) GetHotAndWarmRepos() ([]github.Repository, error) {
 	for rows.Next() {
 		var r github.Repository
 		var pushedStr, updatedStr string
-		var isPriv int
+		var isPriv, isHomeInt int
 
 		err := rows.Scan(
 			&r.Name, &r.FullName, &r.Description,
 			&pushedStr, &updatedStr, &r.DefaultBranch,
-			&isPriv, &r.URL, &r.SSHURL,
+			&isPriv, &r.URL, &r.SSHURL, &isHomeInt, &r.Owner,
 		)
 		if err != nil {
 			return nil, err
 		}
 		r.IsPrivate = isPriv != 0
+		r.IsHomeOrg = isHomeInt != 0
 		r.PushedAt, _ = time.Parse(time.RFC3339, pushedStr)
 		r.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
 		repos = append(repos, r)
@@ -530,7 +880,7 @@ func (d *DB) GetDormantRepos() ([]github.Repository, error) {
 	defer d.mu.RUnlock()
 
 	rows, err := d.db.Query(`
-		SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url
+		SELECT name, full_name, description, pushed_at, updated_at, default_branch, is_private, url, ssh_url, is_home_org, owner
 		FROM repositories
 		WHERE tier = 'dormant'
 		ORDER BY pushed_at DESC
@@ -544,17 +894,18 @@ func (d *DB) GetDormantRepos() ([]github.Repository, error) {
 	for rows.Next() {
 		var r github.Repository
 		var pushedStr, updatedStr string
-		var isPriv int
+		var isPriv, isHomeInt int
 
 		err := rows.Scan(
 			&r.Name, &r.FullName, &r.Description,
 			&pushedStr, &updatedStr, &r.DefaultBranch,
-			&isPriv, &r.URL, &r.SSHURL,
+			&isPriv, &r.URL, &r.SSHURL, &isHomeInt, &r.Owner,
 		)
 		if err != nil {
 			return nil, err
 		}
 		r.IsPrivate = isPriv != 0
+		r.IsHomeOrg = isHomeInt != 0
 		r.PushedAt, _ = time.Parse(time.RFC3339, pushedStr)
 		r.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
 		repos = append(repos, r)
@@ -601,6 +952,9 @@ func (d *DB) UpdateRepoTiers(prs []github.PullRequest, events ...[]github.SquadE
 	for _, pr := range prs {
 		norm := strings.ToLower(github.NormalizeRepoName(pr.Repo))
 		repoPRs[norm] = append(repoPRs[norm], pr)
+		if pr.RepoFullName != "" {
+			repoPRs[strings.ToLower(pr.RepoFullName)] = append(repoPRs[strings.ToLower(pr.RepoFullName)], pr)
+		}
 	}
 
 	repoEvents := make(map[string][]github.SquadEvent)
@@ -667,7 +1021,7 @@ func (d *DB) UpdateRepoTiers(prs []github.PullRequest, events ...[]github.SquadE
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`UPDATE repositories SET tier = ? WHERE name = ?`)
+	stmt, err := tx.Prepare(`UPDATE repositories SET tier = ? WHERE full_name = ? OR name = ?`)
 	if err != nil {
 		return err
 	}
@@ -675,8 +1029,13 @@ func (d *DB) UpdateRepoTiers(prs []github.PullRequest, events ...[]github.SquadE
 
 	for _, item := range list {
 		norm := strings.ToLower(github.NormalizeRepoName(item.repo.Name))
-		tier := CalculateRepoTier(item.repo, repoPRs[norm], repoEvents[norm])
-		if _, err := stmt.Exec(string(tier), item.repo.Name); err != nil {
+		fullNorm := strings.ToLower(item.repo.FullName)
+		prsForRepo := repoPRs[norm]
+		if len(prsForRepo) == 0 && fullNorm != "" {
+			prsForRepo = repoPRs[fullNorm]
+		}
+		tier := CalculateRepoTier(item.repo, prsForRepo, repoEvents[norm])
+		if _, err := stmt.Exec(string(tier), item.repo.FullName, item.repo.Name); err != nil {
 			return err
 		}
 	}
@@ -705,8 +1064,8 @@ func (d *DB) SavePullRequests(prs []github.PullRequest) error {
 		INSERT INTO pull_requests (
 			repo, number, title, author, created_at, updated_at, state,
 			is_draft, review_decision, labels_json, total_comments,
-			unresolved_comments, url, head_ref_name
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			unresolved_comments, url, head_ref_name, repo_full_name, repo_owner
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -724,11 +1083,22 @@ func (d *DB) SavePullRequests(prs []github.PullRequest) error {
 			state = "OPEN"
 		}
 
+		repoFullName := pr.RepoFullName
+		repoOwner := pr.RepoOwner
+		if repoFullName == "" && strings.Contains(pr.Repo, "/") {
+			repoFullName = pr.Repo
+			parts := strings.Split(pr.Repo, "/")
+			repoOwner = parts[0]
+		} else if repoFullName == "" && repoOwner != "" && pr.Repo != "" {
+			repoFullName = repoOwner + "/" + pr.Repo
+		}
+
 		_, err := stmt.Exec(
 			pr.Repo, pr.Number, pr.Title, pr.Author,
 			pr.CreatedAt.Format(time.RFC3339), pr.UpdatedAt.Format(time.RFC3339),
 			state, isDraft, pr.ReviewDecision, string(labelsJSON),
 			pr.TotalComments, pr.UnresolvedComments, pr.URL, pr.HeadRefName,
+			repoFullName, repoOwner,
 		)
 		if err != nil {
 			return err
@@ -738,6 +1108,59 @@ func (d *DB) SavePullRequests(prs []github.PullRequest) error {
 	return tx.Commit()
 }
 
+func (d *DB) SavePullRequest(pr github.PullRequest) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	labelsJSON, _ := json.Marshal(pr.Labels)
+	isDraft := 0
+	if pr.IsDraft {
+		isDraft = 1
+	}
+	state := pr.State
+	if state == "" {
+		state = "OPEN"
+	}
+
+	repoFullName := pr.RepoFullName
+	repoOwner := pr.RepoOwner
+	if repoFullName == "" && strings.Contains(pr.Repo, "/") {
+		repoFullName = pr.Repo
+		parts := strings.Split(pr.Repo, "/")
+		repoOwner = parts[0]
+	} else if repoFullName == "" && repoOwner != "" && pr.Repo != "" {
+		repoFullName = repoOwner + "/" + pr.Repo
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO pull_requests (
+			repo, number, title, author, created_at, updated_at, state,
+			is_draft, review_decision, labels_json, total_comments,
+			unresolved_comments, url, head_ref_name, repo_full_name, repo_owner
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(repo, number) DO UPDATE SET
+			title=excluded.title,
+			author=excluded.author,
+			created_at=excluded.created_at,
+			updated_at=excluded.updated_at,
+			state=excluded.state,
+			is_draft=excluded.is_draft,
+			review_decision=excluded.review_decision,
+			labels_json=excluded.labels_json,
+			total_comments=excluded.total_comments,
+			unresolved_comments=excluded.unresolved_comments,
+			url=excluded.url,
+			head_ref_name=excluded.head_ref_name,
+			repo_full_name=excluded.repo_full_name,
+			repo_owner=excluded.repo_owner
+	`, pr.Repo, pr.Number, pr.Title, pr.Author,
+		pr.CreatedAt.Format(time.RFC3339), pr.UpdatedAt.Format(time.RFC3339),
+		state, isDraft, pr.ReviewDecision, string(labelsJSON),
+		pr.TotalComments, pr.UnresolvedComments, pr.URL, pr.HeadRefName,
+		repoFullName, repoOwner)
+	return err
+}
+
 func (d *DB) GetPullRequests() ([]github.PullRequest, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -745,7 +1168,7 @@ func (d *DB) GetPullRequests() ([]github.PullRequest, error) {
 	rows, err := d.db.Query(`
 		SELECT repo, number, title, author, created_at, updated_at, state,
 		       is_draft, review_decision, labels_json, total_comments,
-		       unresolved_comments, url, head_ref_name
+		       unresolved_comments, url, head_ref_name, repo_full_name, repo_owner
 		FROM pull_requests
 		ORDER BY updated_at DESC
 	`)
@@ -766,6 +1189,7 @@ func (d *DB) GetPullRequests() ([]github.PullRequest, error) {
 			&isDraft, &pr.ReviewDecision, &labelsJSON,
 			&pr.TotalComments, &pr.UnresolvedComments,
 			&pr.URL, &pr.HeadRefName,
+			&pr.RepoFullName, &pr.RepoOwner,
 		)
 		if err != nil {
 			return nil, err
@@ -784,12 +1208,16 @@ func (d *DB) DeletePullRequest(repo string, number int) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	norm := github.NormalizeRepoName(repo)
+	clean := strings.TrimSpace(repo)
+	norm := github.NormalizeRepoName(clean)
 	_, err := d.db.Exec(`
 		DELETE FROM pull_requests
-		WHERE (repo = ? OR LOWER(repo) = LOWER(?) OR repo = ? OR LOWER(repo) = LOWER(?))
-		  AND number = ?
-	`, repo, repo, norm, norm, number)
+		WHERE number = ? AND (
+			repo = ? OR LOWER(repo) = LOWER(?) OR
+			repo = ? OR LOWER(repo) = LOWER(?) OR
+			repo_full_name = ? OR LOWER(repo_full_name) = LOWER(?)
+		)
+	`, number, clean, clean, norm, norm, clean, clean)
 	return err
 }
 
@@ -810,6 +1238,11 @@ func (d *DB) SaveTask(task *github.Task, syncStatus string) error {
 		isSquad = 1
 	}
 
+	isHomeVal := 1
+	if !task.IsHomeRepo && task.RepoOwner != "" {
+		isHomeVal = 0
+	}
+
 	var closedStr sql.NullString
 	if task.ClosedAt != nil && !task.ClosedAt.IsZero() {
 		closedStr = sql.NullString{String: task.ClosedAt.Format(time.RFC3339), Valid: true}
@@ -828,8 +1261,8 @@ func (d *DB) SaveTask(task *github.Task, syncStatus string) error {
 		INSERT INTO tasks (
 			id, number, repo_owner, repo_name, title, body, state, priority,
 			author, assignees_json, labels_json, created_at, updated_at,
-			closed_at, url, is_squad_task, sync_status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			closed_at, url, is_squad_task, sync_status, is_home_repo
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			number=excluded.number,
 			repo_owner=excluded.repo_owner,
@@ -846,11 +1279,12 @@ func (d *DB) SaveTask(task *github.Task, syncStatus string) error {
 			closed_at=excluded.closed_at,
 			url=excluded.url,
 			is_squad_task=excluded.is_squad_task,
-			sync_status=excluded.sync_status
+			sync_status=excluded.sync_status,
+			is_home_repo=excluded.is_home_repo
 	`, id, task.Number, task.RepoOwner, task.RepoName, task.Title, task.Body,
 		task.State, string(task.Priority), task.Author, string(assigneesJSON),
 		string(labelsJSON), task.CreatedAt.Format(time.RFC3339),
-		task.UpdatedAt.Format(time.RFC3339), closedStr, task.URL, isSquad, syncStatus)
+		task.UpdatedAt.Format(time.RFC3339), closedStr, task.URL, isSquad, syncStatus, isHomeVal)
 
 	return err
 }
@@ -873,8 +1307,8 @@ func (d *DB) SaveTasks(tasks []github.Task, isSquad bool, syncStatus string) err
 		INSERT INTO tasks (
 			id, number, repo_owner, repo_name, title, body, state, priority,
 			author, assignees_json, labels_json, created_at, updated_at,
-			closed_at, url, is_squad_task, sync_status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			closed_at, url, is_squad_task, sync_status, is_home_repo
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			number=excluded.number,
 			repo_owner=excluded.repo_owner,
@@ -891,7 +1325,8 @@ func (d *DB) SaveTasks(tasks []github.Task, isSquad bool, syncStatus string) err
 			closed_at=excluded.closed_at,
 			url=excluded.url,
 			is_squad_task=excluded.is_squad_task,
-			sync_status=excluded.sync_status
+			sync_status=excluded.sync_status,
+			is_home_repo=excluded.is_home_repo
 	`)
 	if err != nil {
 		return err
@@ -904,6 +1339,11 @@ func (d *DB) SaveTasks(tasks []github.Task, isSquad bool, syncStatus string) err
 		isSquadInt := 0
 		if isSquad || task.IsSquadTask {
 			isSquadInt = 1
+		}
+
+		isHomeVal := 1
+		if !task.IsHomeRepo && task.RepoOwner != "" {
+			isHomeVal = 0
 		}
 
 		var closedStr sql.NullString
@@ -920,7 +1360,7 @@ func (d *DB) SaveTasks(tasks []github.Task, isSquad bool, syncStatus string) err
 			id, task.Number, task.RepoOwner, task.RepoName, task.Title, task.Body,
 			task.State, string(task.Priority), task.Author, string(assigneesJSON),
 			string(labelsJSON), task.CreatedAt.Format(time.RFC3339),
-			task.UpdatedAt.Format(time.RFC3339), closedStr, task.URL, isSquadInt, syncStatus,
+			task.UpdatedAt.Format(time.RFC3339), closedStr, task.URL, isSquadInt, syncStatus, isHomeVal,
 		)
 		if err != nil {
 			return err
@@ -942,7 +1382,7 @@ func (d *DB) GetTasks(isSquad bool, state string) ([]github.Task, error) {
 	query := `
 		SELECT id, number, repo_owner, repo_name, title, body, state, priority,
 		       author, assignees_json, labels_json, created_at, updated_at,
-		       closed_at, url, is_squad_task
+		       closed_at, url, is_squad_task, is_home_repo
 		FROM tasks
 		WHERE is_squad_task = ?
 	`
@@ -965,18 +1405,19 @@ func (d *DB) GetTasks(isSquad bool, state string) ([]github.Task, error) {
 		var t github.Task
 		var createdStr, updatedStr, assigneesJSON, labelsJSON, prioStr string
 		var closedStr sql.NullString
-		var isSquadVal int
+		var isSquadVal, isHomeVal int
 
 		err := rows.Scan(
 			&t.ID, &t.Number, &t.RepoOwner, &t.RepoName, &t.Title, &t.Body,
 			&t.State, &prioStr, &t.Author, &assigneesJSON, &labelsJSON,
-			&createdStr, &updatedStr, &closedStr, &t.URL, &isSquadVal,
+			&createdStr, &updatedStr, &closedStr, &t.URL, &isSquadVal, &isHomeVal,
 		)
 		if err != nil {
 			return nil, err
 		}
 		t.Priority = github.TaskPriority(prioStr)
 		t.IsSquadTask = isSquadVal != 0
+		t.IsHomeRepo = isHomeVal != 0
 		t.CreatedAt, _ = time.Parse(time.RFC3339, createdStr)
 		t.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
 		if closedStr.Valid && closedStr.String != "" {
@@ -1005,6 +1446,172 @@ func (d *DB) UpdateTaskSyncStatus(id int64, status string) error {
 
 	_, err := d.db.Exec(`UPDATE tasks SET sync_status = ? WHERE id = ?`, status, id)
 	return err
+}
+
+// --- Organizations ---
+
+func (d *DB) SaveOrganization(org github.Organization) error {
+	return d.SaveOrganizations([]github.Organization{org})
+}
+
+func (d *DB) SaveOrganizations(orgs []github.Organization) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO organizations (login, is_home, name, avatar_url, last_synced_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(login) DO UPDATE SET
+			is_home=excluded.is_home,
+			name=excluded.name,
+			avatar_url=excluded.avatar_url,
+			last_synced_at=excluded.last_synced_at
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, o := range orgs {
+		isHome := 0
+		if o.IsHome {
+			isHome = 1
+		}
+		var syncStr sql.NullString
+		if !o.LastSyncedAt.IsZero() {
+			syncStr = sql.NullString{String: o.LastSyncedAt.Format(time.RFC3339), Valid: true}
+		}
+
+		if _, err := stmt.Exec(o.Login, isHome, o.Name, o.AvatarURL, syncStr); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (d *DB) GetOrganizations() ([]github.Organization, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	rows, err := d.db.Query(`SELECT login, is_home, name, avatar_url, last_synced_at FROM organizations ORDER BY is_home DESC, login ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orgs []github.Organization
+	for rows.Next() {
+		var o github.Organization
+		var isHome int
+		var syncStr sql.NullString
+		if err := rows.Scan(&o.Login, &isHome, &o.Name, &o.AvatarURL, &syncStr); err != nil {
+			return nil, err
+		}
+		o.IsHome = isHome != 0
+		if syncStr.Valid && syncStr.String != "" {
+			o.LastSyncedAt, _ = time.Parse(time.RFC3339, syncStr.String)
+		}
+		orgs = append(orgs, o)
+	}
+	return orgs, nil
+}
+
+func (d *DB) GetHomeOrganization() (*github.Organization, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var o github.Organization
+	var isHome int
+	var syncStr sql.NullString
+	err := d.db.QueryRow(`SELECT login, is_home, name, avatar_url, last_synced_at FROM organizations WHERE is_home = 1 LIMIT 1`).
+		Scan(&o.Login, &isHome, &o.Name, &o.AvatarURL, &syncStr)
+	if err != nil {
+		return nil, err
+	}
+	o.IsHome = isHome != 0
+	if syncStr.Valid && syncStr.String != "" {
+		o.LastSyncedAt, _ = time.Parse(time.RFC3339, syncStr.String)
+	}
+	return &o, nil
+}
+
+func (d *DB) SetHomeOrganization(login string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`UPDATE organizations SET is_home = 0`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE organizations SET is_home = 1 WHERE login = ? OR LOWER(login) = LOWER(?)`, login, login); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (d *DB) DeleteOrganization(login string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, err := d.db.Exec(`DELETE FROM organizations WHERE login = ? OR LOWER(login) = LOWER(?)`, login, login)
+	return err
+}
+
+// --- Processed Events (Webhook Deduplication) ---
+
+func (d *DB) RecordProcessedEvent(deliveryID, eventType string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	res, err := d.db.Exec(`
+		INSERT OR IGNORE INTO processed_events (delivery_id, event_type, received_at)
+		VALUES (?, ?, ?)
+	`, deliveryID, eventType, time.Now().Format(time.RFC3339))
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (d *DB) IsEventProcessed(deliveryID string) (bool, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	var count int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM processed_events WHERE delivery_id = ?`, deliveryID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (d *DB) PruneProcessedEvents(olderThan time.Duration) (int64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	cutoff := time.Now().Add(-olderThan).Format(time.RFC3339)
+	res, err := d.db.Exec(`DELETE FROM processed_events WHERE received_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // --- Squad Activity ---

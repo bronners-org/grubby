@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,66 +24,50 @@ const (
 )
 
 func (m Model) isSquadTasks() bool {
-	if m.ActiveTab == TabSquadTasks {
-		return true
+	if m.InlineAdding {
+		return m.TaskCreateTarget == TaskTargetSquad
 	}
-	return m.ActiveTaskSubtab == TaskSubtabSquad
+	items := m.getVisibleTaskItems()
+	if m.TaskCursor >= 0 && m.TaskCursor < len(items) {
+		return items[m.TaskCursor].section == "squad"
+	}
+	return false
 }
 
 func (m Model) isTasksTab() bool {
-	return m.ActiveTab == TabMyTasks || m.ActiveTab == TabSquadTasks
+	return m.ActiveTab == TabTasks
 }
 
-func (m Model) getSquadPartitionedTasks() ([]github.Task, []github.Task) {
-	var reviews []github.Task
-	var general []github.Task
-	for _, t := range m.SquadTasks {
-		if t.IsPRReview() {
-			reviews = append(reviews, t)
-		} else {
-			general = append(general, t)
+func sortTaskList(list []github.Task) []github.Task {
+	slice := append([]github.Task{}, list...)
+	sort.SliceStable(slice, func(i, j int) bool {
+		rankI := slice[i].Priority.Rank()
+		rankJ := slice[j].Priority.Rank()
+		if rankI != rankJ {
+			return rankI < rankJ
 		}
-	}
+		if !slice[i].UpdatedAt.Equal(slice[j].UpdatedAt) {
+			return slice[i].UpdatedAt.After(slice[j].UpdatedAt)
+		}
+		return slice[i].Number > slice[j].Number
+	})
+	return slice
+}
 
-	sortTasks := func(slice []github.Task) {
-		sort.SliceStable(slice, func(i, j int) bool {
-			rankI := slice[i].Priority.Rank()
-			rankJ := slice[j].Priority.Rank()
-			if rankI != rankJ {
-				return rankI < rankJ
-			}
-			if !slice[i].UpdatedAt.Equal(slice[j].UpdatedAt) {
-				return slice[i].UpdatedAt.After(slice[j].UpdatedAt)
-			}
-			return slice[i].Number > slice[j].Number
-		})
-	}
+func (m Model) getSortedPersonalTasks() []github.Task {
+	return sortTaskList(m.PersonalTasks)
+}
 
-	sortTasks(reviews)
-	sortTasks(general)
-	return reviews, general
+func (m Model) getSortedSquadTasks() []github.Task {
+	return sortTaskList(m.SquadTasks)
+}
+
+func (m Model) getAllOrderedTasks() []github.Task {
+	return append(m.getSortedPersonalTasks(), m.getSortedSquadTasks()...)
 }
 
 func (m Model) getActiveTasks() []github.Task {
-	if !m.isSquadTasks() {
-		var list []github.Task
-		list = append(list, m.PersonalTasks...)
-		sort.SliceStable(list, func(i, j int) bool {
-			rankI := list[i].Priority.Rank()
-			rankJ := list[j].Priority.Rank()
-			if rankI != rankJ {
-				return rankI < rankJ
-			}
-			if !list[i].UpdatedAt.Equal(list[j].UpdatedAt) {
-				return list[i].UpdatedAt.After(list[j].UpdatedAt)
-			}
-			return list[i].Number > list[j].Number
-		})
-		return list
-	}
-
-	reviews, general := m.getSquadPartitionedTasks()
-	return append(reviews, general...)
+	return m.getAllOrderedTasks()
 }
 
 func (m Model) getDisplayTasks() []github.Task {
@@ -105,68 +90,100 @@ const (
 	locCompletedTask
 )
 
+type visibleTaskItem struct {
+	navNum   int
+	location cursorLocationType // locInlineNew, locActiveTask, locCompletedTask
+	task     *github.Task
+	section  string // "personal", "squad", "completed"
+}
+
+func (m Model) getVisibleTaskItems() []visibleTaskItem {
+	var items []visibleTaskItem
+	counter := 1
+
+	// 1. Personal tasks
+	if !m.TaskCollapsePersonal {
+		if m.InlineAdding && m.TaskCreateTarget == TaskTargetPersonal {
+			items = append(items, visibleTaskItem{
+				navNum:   counter,
+				location: locInlineNew,
+				task:     nil,
+				section:  "personal",
+			})
+			counter++
+		}
+		for _, t := range m.getSortedPersonalTasks() {
+			taskCopy := t
+			items = append(items, visibleTaskItem{
+				navNum:   counter,
+				location: locActiveTask,
+				task:     &taskCopy,
+				section:  "personal",
+			})
+			counter++
+		}
+	}
+
+	// 2. Squad tasks
+	if !m.TaskCollapseSquad {
+		if m.InlineAdding && m.TaskCreateTarget == TaskTargetSquad {
+			items = append(items, visibleTaskItem{
+				navNum:   counter,
+				location: locInlineNew,
+				task:     nil,
+				section:  "squad",
+			})
+			counter++
+		}
+		for _, t := range m.getSortedSquadTasks() {
+			taskCopy := t
+			items = append(items, visibleTaskItem{
+				navNum:   counter,
+				location: locActiveTask,
+				task:     &taskCopy,
+				section:  "squad",
+			})
+			counter++
+		}
+	}
+
+	// 3. Completed tasks (ignored by [g] and cursor when collapsed!)
+	if !m.TaskCollapseCompleted {
+		for _, t := range m.getRecentDoneTasks() {
+			taskCopy := t
+			items = append(items, visibleTaskItem{
+				navNum:   counter,
+				location: locCompletedTask,
+				task:     &taskCopy,
+				section:  "completed",
+			})
+			counter++
+		}
+	}
+
+	return items
+}
+
 func (m Model) getCursorTarget() (cursorLocationType, *github.Task) {
-	recentDone := m.getRecentDoneTasks()
-
-	if m.isSquadTasks() {
-		reviews, general := m.getSquadPartitionedTasks()
-		cursor := m.TaskCursor
-
-		if cursor < len(reviews) {
-			return locActiveTask, &reviews[cursor]
-		}
-		cursor -= len(reviews)
-
-		if m.InlineAdding {
-			if cursor == 0 {
-				return locInlineNew, nil
-			}
-			cursor--
-		}
-
-		if cursor < len(general) {
-			return locActiveTask, &general[cursor]
-		}
-		cursor -= len(general)
-
-		if cursor < len(recentDone) {
-			return locCompletedTask, &recentDone[cursor]
-		}
+	items := m.getVisibleTaskItems()
+	if len(items) == 0 {
 		return locActiveTask, nil
 	}
-
-	// Personal tasks
-	activeTasks := m.getActiveTasks()
-	cursor := m.TaskCursor
-	if m.InlineAdding {
-		if cursor == 0 {
-			return locInlineNew, nil
-		}
-		cursor--
+	idx := m.TaskCursor
+	if idx < 0 {
+		idx = 0
 	}
-
-	if cursor < len(activeTasks) {
-		return locActiveTask, &activeTasks[cursor]
+	if idx >= len(items) {
+		idx = len(items) - 1
 	}
-
-	cursor -= len(activeTasks)
-	if cursor < len(recentDone) {
-		return locCompletedTask, &recentDone[cursor]
-	}
-
-	return locActiveTask, nil
+	return items[idx].location, items[idx].task
 }
 
 func (m Model) getTotalTaskRows() int {
-	total := len(m.getActiveTasks()) + len(m.getRecentDoneTasks())
-	if m.InlineAdding {
-		total++
-	}
-	return total
+	return len(m.getVisibleTaskItems())
 }
 
 func (m Model) renderTasksView() string {
-	activeTasks := m.getActiveTasks()
 	recentDone := m.getRecentDoneTasks()
 
 	// 1. Task Board Header Banner
@@ -174,38 +191,40 @@ func (m Model) renderTasksView() string {
 	squadOpen := len(m.SquadTasks)
 	allDoneCount := len(m.getSortedDoneTasks())
 
-	var activeRepo string
-	var boardName string
-	if m.isSquadTasks() {
-		activeRepo = m.getTaskTargetRepoFullName(TaskTargetSquad)
-		squadName := ""
-		if m.Config != nil && m.Config.ActiveSquad != "" {
-			squadName = fmt.Sprintf(" (%s)", m.Config.ActiveSquad)
-		}
-		boardName = fmt.Sprintf("👥 Squad Tasks%s (%d)", squadName, squadOpen)
-	} else {
-		activeRepo = m.getTaskTargetRepoFullName(TaskTargetPersonal)
-		boardName = fmt.Sprintf("📋 My Tasks (%d)", mineOpen)
-	}
+	personalRepo := m.getTaskTargetRepoFullName(TaskTargetPersonal)
+	squadRepo := m.getTaskTargetRepoFullName(TaskTargetSquad)
 
-	boardBadge := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Render(boardName)
+	boardBadge := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Render(
+		fmt.Sprintf("📋 Tasks (Mine: %d  •  Squad: %d)", mineOpen, squadOpen),
+	)
 
 	var headerBanner string
-	if m.InlineEditing {
-		headerBanner = "  " + boardBadge + MetaBarStyle.Render(fmt.Sprintf("  •  Repo: %s  •  [Editing Title: Enter to save, Esc to cancel]", activeRepo))
+	if m.TaskLeaderMode == TaskLeaderCreate {
+		leaderNotice := lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render("  •  [Add Task: Press [s] for Squad Task, [m] for My Task, [Esc] Cancel]")
+		headerBanner = "  " + boardBadge + leaderNotice
+	} else if m.TaskLeaderMode == TaskLeaderGo {
+		bufStr := m.TaskGoBuffer
+		if bufStr == "" {
+			bufStr = "_"
+		}
+		leaderNotice := lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render(fmt.Sprintf("  •  [Go to Task: Number [%s] + [Enter], [f] First, [l] Last, [Esc] Cancel]", bufStr))
+		headerBanner = "  " + boardBadge + leaderNotice
+	} else if m.InlineEditing {
+		headerBanner = "  " + boardBadge + MetaBarStyle.Render("  •  [Editing Title: Enter to save, Esc to cancel]")
 	} else if m.InlineAdding {
-		headerBanner = "  " + boardBadge + MetaBarStyle.Render(fmt.Sprintf("  •  Repo: %s  •  [New Task: Enter to create, Esc to cancel]", activeRepo))
+		targetName := "Squad Task"
+		if m.TaskCreateTarget == TaskTargetPersonal {
+			targetName = "My Task"
+		}
+		headerBanner = "  " + boardBadge + MetaBarStyle.Render(fmt.Sprintf("  •  [New %s: Enter to create, Esc to cancel]", targetName))
 	} else {
 		allDoneBadge := lipgloss.NewStyle().Foreground(lipgloss.Color("#8888AA")).Render(fmt.Sprintf("[d] All Done (%d)", allDoneCount))
-		if m.isSquadTasks() {
-			headerBanner = "  " + boardBadge + MetaBarStyle.Render(fmt.Sprintf("  •  Repo: %s  •  %s  •  [a] Add Task  [A] Assign  [n] Notes  [Space] Done", activeRepo, allDoneBadge))
-		} else {
-			headerBanner = "  " + boardBadge + MetaBarStyle.Render(fmt.Sprintf("  •  Repo: %s  •  %s  •  [a] Add Task  [n] Notes  [Space] Done", activeRepo, allDoneBadge))
-		}
+		reposInfo := fmt.Sprintf("Mine: %s  •  Squad: %s", personalRepo, squadRepo)
+		headerBanner = "  " + boardBadge + MetaBarStyle.Render(fmt.Sprintf("  •  %s  •  %s  •  [a] Add (s/m)  [g] Go to  [Space] Done", reposInfo, allDoneBadge))
 	}
 
 	// 2. Table Layout
-	cursorW := 3
+	cursorW := 5
 	prioW := 10
 	notesW := 3
 	assigneeW := 16
@@ -236,7 +255,15 @@ func (m Model) renderTasksView() string {
 	)
 	renderedTableHead := TableHeaderStyle.Render(tableHead)
 
-	formatTaskRow := func(t github.Task, isCurrent bool) string {
+	formatTaskRow := func(t github.Task, isCurrent bool, navNum int) string {
+		isFlashing, flashBg := false, lipgloss.Color("")
+		if t.ID != 0 {
+			isFlashing, flashBg = m.isEntityFlashing(fmt.Sprintf("task:%d", t.ID))
+		}
+		if !isFlashing {
+			isFlashing, flashBg = m.isEntityFlashing(fmt.Sprintf("task:%s#%d", t.RepoName, t.Number))
+		}
+
 		var prioBadge string
 		if t.IsPRReview() {
 			switch t.Priority {
@@ -296,14 +323,27 @@ func (m Model) renderTasksView() string {
 		updatedText := formatTimeAgo(t.UpdatedAt)
 
 		issueRef := fmt.Sprintf("%s#%d", t.RepoName, t.Number)
+		if t.IsHomeRepo {
+			issueRef = fmt.Sprintf("🏠 %s#%d", t.RepoName, t.Number)
+		}
 		if len(issueRef) > repoW-2 && repoW > 3 {
 			issueRef = issueRef[:repoW-3] + "…"
 		}
 		issueRefText := lipgloss.NewStyle().Foreground(HighlightColor).Render(issueRef)
 
-		cursorText := "  "
-		if isCurrent {
+		var cursorText string
+		if m.TaskLeaderMode == TaskLeaderGo && navNum > 0 {
+			if isCurrent {
+				cursorText = lipgloss.NewStyle().Bold(true).Foreground(HighlightColor).Render(fmt.Sprintf("[%d]", navNum))
+			} else {
+				cursorText = lipgloss.NewStyle().Foreground(SecondaryColor).Render(fmt.Sprintf("[%d]", navNum))
+			}
+		} else if isFlashing {
+			cursorText = "⚡ "
+		} else if isCurrent {
 			cursorText = "▶ "
+		} else {
+			cursorText = "  "
 		}
 
 		rowCells := lipgloss.JoinHorizontal(lipgloss.Top,
@@ -317,14 +357,118 @@ func (m Model) renderTasksView() string {
 		)
 
 		if isCurrent {
+			if isFlashing {
+				return SelectedRowStyle.Background(flashBg).MaxHeight(1).Render(rowCells)
+			}
+			return SelectedRowStyle.MaxHeight(1).Render(rowCells)
+		} else if isFlashing {
+			return lipgloss.NewStyle().Background(flashBg).MaxHeight(1).Render(rowCells)
+		}
+		return NormalRowStyle.MaxHeight(1).Render(rowCells)
+	}
+
+	formatCompletedTaskRow := func(t github.Task, isCurrent bool, navNum int) string {
+		var prioBadge string
+		if t.IsPRReview() {
+			switch t.Priority {
+			case github.PriorityHigh:
+				prioBadge = lipgloss.NewStyle().Foreground(DangerColor).Render("[✓⑂ HIGH]")
+			case github.PriorityLow:
+				prioBadge = lipgloss.NewStyle().Foreground(SuccessColor).Render("[✓⑂ LOW]")
+			default:
+				prioBadge = lipgloss.NewStyle().Foreground(WarningColor).Render("[✓⑂ MED]")
+			}
+		} else {
+			switch t.Priority {
+			case github.PriorityHigh:
+				prioBadge = lipgloss.NewStyle().Foreground(DangerColor).Render("[✓ HIGH]")
+			case github.PriorityLow:
+				prioBadge = lipgloss.NewStyle().Foreground(SuccessColor).Render("[✓ LOW]")
+			default:
+				prioBadge = lipgloss.NewStyle().Foreground(WarningColor).Render("[✓ MED]")
+			}
+		}
+
+		displayTitle := strings.ReplaceAll(strings.ReplaceAll(t.Title, "\r", " "), "\n", " ")
+		if t.IsPRReview() {
+			prPrefix := lipgloss.NewStyle().Foreground(lipgloss.Color("#A371F7")).Render("⑂ ")
+			displayTitle = "✓ " + prPrefix + displayTitle
+		} else {
+			displayTitle = "✓ " + displayTitle
+		}
+		if len(displayTitle) > titleW-2 && titleW > 3 {
+			displayTitle = displayTitle[:titleW-3] + "…"
+		}
+		if isCurrent {
+			displayTitle = lipgloss.NewStyle().Bold(true).Render(displayTitle)
+		} else {
+			displayTitle = lipgloss.NewStyle().Foreground(MutedColor).Render(displayTitle)
+		}
+
+		notesIcon := " · "
+		if len(strings.TrimSpace(t.Body)) > 0 {
+			notesIcon = "📝"
+		}
+
+		var assigneeText string
+		if len(t.Assignees) > 0 {
+			assigneeText = "@" + strings.Join(t.Assignees, ", @")
+			if len(assigneeText) > assigneeW-2 && assigneeW > 3 {
+				assigneeText = assigneeText[:assigneeW-3] + "…"
+			}
+			assigneeText = lipgloss.NewStyle().Foreground(SecondaryColor).Render(assigneeText)
+		} else {
+			assigneeText = lipgloss.NewStyle().Foreground(MutedColor).Render("Unassigned")
+		}
+
+		var dateText string
+		if t.ClosedAt != nil {
+			dateText = formatTimeAgo(*t.ClosedAt)
+		} else {
+			dateText = formatTimeAgo(t.UpdatedAt)
+		}
+
+		issueRef := fmt.Sprintf("%s#%d", t.RepoName, t.Number)
+		if t.IsHomeRepo {
+			issueRef = fmt.Sprintf("🏠 %s#%d", t.RepoName, t.Number)
+		}
+		if len(issueRef) > repoW-2 && repoW > 3 {
+			issueRef = issueRef[:repoW-3] + "…"
+		}
+		issueRefText := lipgloss.NewStyle().Foreground(HighlightColor).Render(issueRef)
+
+		var cursorText string
+		if m.TaskLeaderMode == TaskLeaderGo && navNum > 0 {
+			if isCurrent {
+				cursorText = lipgloss.NewStyle().Bold(true).Foreground(HighlightColor).Render(fmt.Sprintf("[%d]", navNum))
+			} else {
+				cursorText = lipgloss.NewStyle().Foreground(MutedColor).Render(fmt.Sprintf("[%d]", navNum))
+			}
+		} else if isCurrent {
+			cursorText = "▶ "
+		} else {
+			cursorText = "  "
+		}
+
+		rowCells := lipgloss.JoinHorizontal(lipgloss.Top,
+			cursorCol.Render(cursorText),
+			prioCol.Render(prioBadge),
+			titleCol.Render(displayTitle),
+			notesCol.Render(notesIcon),
+			assigneeCol.Render(assigneeText),
+			updatedCol.Render(dateText),
+			repoCol.Render(issueRefText),
+		)
+
+		if isCurrent {
 			return SelectedRowStyle.MaxHeight(1).Render(rowCells)
 		}
 		return NormalRowStyle.MaxHeight(1).Render(rowCells)
 	}
 
-	var renderInlineAddingRow func() string
+	var renderInlineAddingRow func(navNum int) string
 	if m.InlineAdding {
-		renderInlineAddingRow = func() string {
+		renderInlineAddingRow = func(navNum int) string {
 			prioBadge := lipgloss.NewStyle().Bold(true).Foreground(WarningColor).Render("[🟡 MED]")
 			switch m.InlineNewPriority {
 			case github.PriorityHigh:
@@ -346,8 +490,13 @@ func (m Model) renderTasksView() string {
 			dateText := lipgloss.NewStyle().Foreground(MutedColor).Render("Draft")
 			issueText := lipgloss.NewStyle().Foreground(WarningColor).Render("(new)")
 
+			cursorText := "▶ "
+			if m.TaskLeaderMode == TaskLeaderGo && navNum > 0 {
+				cursorText = lipgloss.NewStyle().Bold(true).Foreground(HighlightColor).Render(fmt.Sprintf("[%d]", navNum))
+			}
+
 			inlineCells := lipgloss.JoinHorizontal(lipgloss.Top,
-				cursorCol.Render("▶ "),
+				cursorCol.Render(cursorText),
 				prioCol.Render(prioBadge),
 				titleCol.Render(m.InlineNewTitleInput.View()),
 				notesCol.Render(notesIcon),
@@ -359,170 +508,103 @@ func (m Model) renderTasksView() string {
 		}
 	}
 
+	personal := m.getSortedPersonalTasks()
+	squad := m.getSortedSquadTasks()
+	visibleItems := m.getVisibleTaskItems()
+
 	var rows []string
 	rows = append(rows, headerBanner)
-	rowIdx := 0
 
-	if m.isSquadTasks() {
-		reviews, general := m.getSquadPartitionedTasks()
-
-		// 1. OUTSTANDING REVIEWS TABLE
-		sepReviews := lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(
-			fmt.Sprintf("─── ⑂ OUTSTANDING REVIEWS (%d) ──────────────────────────────────────────────────────────", len(reviews)),
-		)
-		rows = append(rows, "", sepReviews, renderedTableHead)
-
-		if len(reviews) == 0 {
-			rows = append(rows, lipgloss.NewStyle().Foreground(MutedColor).Render("   ✓ No outstanding pull request reviews for squad."))
-		} else {
-			for _, t := range reviews {
-				isCurrent := (rowIdx == m.TaskCursor)
-				rows = append(rows, formatTaskRow(t, isCurrent))
-				rowIdx++
-			}
-		}
-
-		// 2. SQUAD TASKS TABLE
-		sepTasks := lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render(
-			fmt.Sprintf("─── 📋 SQUAD TASKS (%d) ──────────────────────────────────────────────────────────────────", len(general)),
-		)
-		rows = append(rows, "", sepTasks, renderedTableHead)
-
-		if m.InlineAdding {
-			rows = append(rows, renderInlineAddingRow())
-			rowIdx++
-		}
-
-		if len(general) == 0 && !m.InlineAdding {
-			rows = append(rows, lipgloss.NewStyle().Foreground(MutedColor).Render("   No active squad tasks. Press [a] to add a task inline!"))
-		} else {
-			for _, t := range general {
-				isCurrent := (rowIdx == m.TaskCursor)
-				rows = append(rows, formatTaskRow(t, isCurrent))
-				rowIdx++
-			}
-		}
+	// 1. MY TASKS TABLE
+	var personalIcon string
+	if m.TaskCollapsePersonal {
+		personalIcon = "▶"
 	} else {
-		// Personal tasks
-		rows = append(rows, "", renderedTableHead)
+		personalIcon = "▼"
+	}
+	sepPersonal := lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(
+		fmt.Sprintf("─── %s 📋 MY TASKS (%d) ──────────────────────────────────────────────────────────", personalIcon, len(personal)),
+	)
+	rows = append(rows, "", sepPersonal)
 
-		if m.InlineAdding {
-			rows = append(rows, renderInlineAddingRow())
-			rowIdx++
+	if !m.TaskCollapsePersonal {
+		rows = append(rows, renderedTableHead)
+		if m.InlineAdding && m.TaskCreateTarget == TaskTargetPersonal {
+			navNum := 1
+			for _, item := range visibleItems {
+				if item.location == locInlineNew && item.section == "personal" {
+					navNum = item.navNum
+					break
+				}
+			}
+			rows = append(rows, renderInlineAddingRow(navNum))
 		}
 
-		if len(activeTasks) == 0 && !m.InlineAdding {
-			rows = append(rows, lipgloss.NewStyle().Foreground(MutedColor).Render("   No active tasks. Press [a] to add a task inline!"))
+		if len(personal) == 0 && (!m.InlineAdding || m.TaskCreateTarget != TaskTargetPersonal) {
+			rows = append(rows, lipgloss.NewStyle().Foreground(MutedColor).Render("   No active personal tasks. Press [a] then [m] to add a task!"))
 		} else {
-			for _, t := range activeTasks {
-				isCurrent := (rowIdx == m.TaskCursor)
-				rows = append(rows, formatTaskRow(t, isCurrent))
-				rowIdx++
+			for _, item := range visibleItems {
+				if item.section == "personal" && item.location == locActiveTask && item.task != nil {
+					isCurrent := (item.navNum-1 == m.TaskCursor)
+					rows = append(rows, formatTaskRow(*item.task, isCurrent, item.navNum))
+				}
+			}
+		}
+	}
+
+	// 2. SQUAD TASKS TABLE
+	var squadIcon string
+	if m.TaskCollapseSquad {
+		squadIcon = "▶"
+	} else {
+		squadIcon = "▼"
+	}
+	sepSquad := lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render(
+		fmt.Sprintf("─── %s 👥 SQUAD TASKS (%d) ──────────────────────────────────────────────────────────", squadIcon, len(squad)),
+	)
+	rows = append(rows, "", sepSquad)
+
+	if !m.TaskCollapseSquad {
+		rows = append(rows, renderedTableHead)
+		if m.InlineAdding && m.TaskCreateTarget == TaskTargetSquad {
+			navNum := 1
+			for _, item := range visibleItems {
+				if item.location == locInlineNew && item.section == "squad" {
+					navNum = item.navNum
+					break
+				}
+			}
+			rows = append(rows, renderInlineAddingRow(navNum))
+		}
+
+		if len(squad) == 0 && (!m.InlineAdding || m.TaskCreateTarget != TaskTargetSquad) {
+			rows = append(rows, lipgloss.NewStyle().Foreground(MutedColor).Render("   No active squad tasks. Press [a] then [s] to add a task!"))
+		} else {
+			for _, item := range visibleItems {
+				if item.section == "squad" && item.location == locActiveTask && item.task != nil {
+					isCurrent := (item.navNum-1 == m.TaskCursor)
+					rows = append(rows, formatTaskRow(*item.task, isCurrent, item.navNum))
+				}
 			}
 		}
 	}
 
 	// Completed Tasks Section (Last 5)
 	if len(recentDone) > 0 {
-		sepText := fmt.Sprintf("─── COMPLETED (Last %d • [d] Show All %d) ──────────────────────────────────────────────────────────", len(recentDone), allDoneCount)
-		sep := lipgloss.NewStyle().Foreground(lipgloss.Color("#555566")).Render(sepText)
-		rows = append(rows, "", sep)
+		if m.TaskCollapseCompleted {
+			sepText := fmt.Sprintf("─── ▶ COMPLETED (%d • [D] Expand • [d] Show All) ───────────────────────────────────────────────────", allDoneCount)
+			sep := lipgloss.NewStyle().Foreground(lipgloss.Color("#555566")).Render(sepText)
+			rows = append(rows, "", sep)
+		} else {
+			sepText := fmt.Sprintf("─── ▼ COMPLETED (Last %d • [D] Collapse • [d] Show All %d) ──────────────────────────────────────────", len(recentDone), allDoneCount)
+			sep := lipgloss.NewStyle().Foreground(lipgloss.Color("#555566")).Render(sepText)
+			rows = append(rows, "", sep)
 
-		// Adjust rowIdx to account for remaining active tasks if scrolled
-		baseDoneIdx := len(activeTasks)
-		if m.InlineAdding {
-			baseDoneIdx++
-		}
-
-		for i, t := range recentDone {
-			curIdx := baseDoneIdx + i
-			isCurrent := (curIdx == m.TaskCursor)
-
-			var prioBadge string
-			if t.IsPRReview() {
-				switch t.Priority {
-				case github.PriorityHigh:
-					prioBadge = lipgloss.NewStyle().Foreground(DangerColor).Render("[✓⑂ HIGH]")
-				case github.PriorityLow:
-					prioBadge = lipgloss.NewStyle().Foreground(SuccessColor).Render("[✓⑂ LOW]")
-				default:
-					prioBadge = lipgloss.NewStyle().Foreground(WarningColor).Render("[✓⑂ MED]")
+			for _, item := range visibleItems {
+				if item.section == "completed" && item.task != nil {
+					isCurrent := (item.navNum-1 == m.TaskCursor)
+					rows = append(rows, formatCompletedTaskRow(*item.task, isCurrent, item.navNum))
 				}
-			} else {
-				switch t.Priority {
-				case github.PriorityHigh:
-					prioBadge = lipgloss.NewStyle().Foreground(DangerColor).Render("[✓ HIGH]")
-				case github.PriorityLow:
-					prioBadge = lipgloss.NewStyle().Foreground(SuccessColor).Render("[✓ LOW]")
-				default:
-					prioBadge = lipgloss.NewStyle().Foreground(WarningColor).Render("[✓ MED]")
-				}
-			}
-
-			displayTitle := strings.ReplaceAll(strings.ReplaceAll(t.Title, "\r", " "), "\n", " ")
-			if t.IsPRReview() {
-				prPrefix := lipgloss.NewStyle().Foreground(lipgloss.Color("#A371F7")).Render("⑂ ")
-				displayTitle = "✓ " + prPrefix + displayTitle
-			} else {
-				displayTitle = "✓ " + displayTitle
-			}
-			if len(displayTitle) > titleW-2 && titleW > 3 {
-				displayTitle = displayTitle[:titleW-3] + "…"
-			}
-			if isCurrent {
-				displayTitle = lipgloss.NewStyle().Bold(true).Render(displayTitle)
-			} else {
-				displayTitle = lipgloss.NewStyle().Foreground(MutedColor).Render(displayTitle)
-			}
-
-			notesIcon := " · "
-			if len(strings.TrimSpace(t.Body)) > 0 {
-				notesIcon = "📝"
-			}
-
-			var assigneeText string
-			if len(t.Assignees) > 0 {
-				assigneeText = "@" + strings.Join(t.Assignees, ", @")
-				if len(assigneeText) > assigneeW-2 && assigneeW > 3 {
-					assigneeText = assigneeText[:assigneeW-3] + "…"
-				}
-				assigneeText = lipgloss.NewStyle().Foreground(SecondaryColor).Render(assigneeText)
-			} else {
-				assigneeText = lipgloss.NewStyle().Foreground(MutedColor).Render("Unassigned")
-			}
-
-			var dateText string
-			if t.ClosedAt != nil {
-				dateText = formatTimeAgo(*t.ClosedAt)
-			} else {
-				dateText = formatTimeAgo(t.UpdatedAt)
-			}
-
-			issueRef := fmt.Sprintf("%s#%d", t.RepoName, t.Number)
-			if len(issueRef) > repoW-2 && repoW > 3 {
-				issueRef = issueRef[:repoW-3] + "…"
-			}
-			issueRefText := lipgloss.NewStyle().Foreground(HighlightColor).Render(issueRef)
-
-			cursorText := "  "
-			if isCurrent {
-				cursorText = "▶ "
-			}
-
-			rowCells := lipgloss.JoinHorizontal(lipgloss.Top,
-				cursorCol.Render(cursorText),
-				prioCol.Render(prioBadge),
-				titleCol.Render(displayTitle),
-				notesCol.Render(notesIcon),
-				assigneeCol.Render(assigneeText),
-				updatedCol.Render(dateText),
-				repoCol.Render(issueRefText),
-			)
-
-			if isCurrent {
-				rows = append(rows, SelectedRowStyle.MaxHeight(1).Render(rowCells))
-			} else {
-				rows = append(rows, NormalRowStyle.MaxHeight(1).Render(rowCells))
 			}
 		}
 	}
@@ -722,6 +804,153 @@ func (m Model) handleTasksKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// 2b. Handle TaskLeaderCreate mode ('a' leader)
+	if m.TaskLeaderMode == TaskLeaderCreate {
+		switch msg.String() {
+		case "s", "S":
+			m.TaskLeaderMode = TaskLeaderNone
+			m.InlineAdding = true
+			m.TaskCreateTarget = TaskTargetSquad
+			m.InlineNewNotes = ""
+			m.InlineNewPriority = github.PriorityMedium
+			m.InlineNewAssignee = ""
+			m.TaskCursor = len(m.getSortedPersonalTasks())
+			ti := textinput.New()
+			ti.Placeholder = "What needs to be done for squad? (Enter to create, Esc to cancel)"
+			ti.Prompt = ""
+			ti.Focus()
+			m.InlineNewTitleInput = ti
+			m.StatusMsg = "Creating Squad Task in " + m.getTaskTargetRepoFullName(TaskTargetSquad)
+			m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+			return m, textinput.Blink
+
+		case "m", "M":
+			m.TaskLeaderMode = TaskLeaderNone
+			m.InlineAdding = true
+			m.TaskCreateTarget = TaskTargetPersonal
+			m.InlineNewNotes = ""
+			m.InlineNewPriority = github.PriorityMedium
+			m.InlineNewAssignee = m.AuthUser
+			m.TaskCursor = 0
+			ti := textinput.New()
+			ti.Placeholder = "What needs to be done? (Enter to create, Esc to cancel)"
+			ti.Prompt = ""
+			ti.Focus()
+			m.InlineNewTitleInput = ti
+			m.StatusMsg = "Creating My Task in " + m.getTaskTargetRepoFullName(TaskTargetPersonal)
+			m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+			return m, textinput.Blink
+
+		case "esc":
+			m.TaskLeaderMode = TaskLeaderNone
+			m.StatusMsg = "Cancelled task creation"
+			m.StatusMsgTimer = time.Now().Add(1500 * time.Millisecond)
+			return m, nil
+
+		default:
+			m.StatusMsg = "Press [s] for Squad Task, [m] for My Task, or [Esc] to cancel"
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+		}
+	}
+
+	// 2c. Handle TaskLeaderGo mode ('g' leader)
+	if m.TaskLeaderMode == TaskLeaderGo {
+		switch msg.String() {
+		case "f", "g":
+			m.TaskLeaderMode = TaskLeaderNone
+			m.TaskGoBuffer = ""
+			m.TaskCursor = 0
+			m.StatusMsg = "Jumped to first task"
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "l", "G":
+			m.TaskLeaderMode = TaskLeaderNone
+			m.TaskGoBuffer = ""
+			if totalRows > 0 {
+				m.TaskCursor = totalRows - 1
+			}
+			m.StatusMsg = "Jumped to last task"
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
+			m.TaskGoBuffer += msg.String()
+			m.StatusMsg = fmt.Sprintf("Go to task: %s (press Enter)", m.TaskGoBuffer)
+			m.StatusMsgTimer = time.Now().Add(5 * time.Second)
+			return m, nil
+
+		case "backspace":
+			if len(m.TaskGoBuffer) > 0 {
+				m.TaskGoBuffer = m.TaskGoBuffer[:len(m.TaskGoBuffer)-1]
+				m.StatusMsg = fmt.Sprintf("Go to task: %s (press Enter)", m.TaskGoBuffer)
+				m.StatusMsgTimer = time.Now().Add(5 * time.Second)
+			}
+			return m, nil
+
+		case "enter":
+			buf := m.TaskGoBuffer
+			m.TaskLeaderMode = TaskLeaderNone
+			m.TaskGoBuffer = ""
+			targetNum, err := strconv.Atoi(buf)
+			if err != nil || targetNum <= 0 {
+				m.StatusMsg = "Invalid task number"
+				m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+				return m, nil
+			}
+
+			visibleItems := m.getVisibleTaskItems()
+			foundIdx := -1
+			var foundTask *github.Task
+
+			// 1. Check if targetNum matches the visible label number [1], [2], etc.
+			for idx, item := range visibleItems {
+				if item.navNum == targetNum {
+					foundIdx = idx
+					foundTask = item.task
+					break
+				}
+			}
+			// 2. If not found by nav label, check if targetNum matches GitHub issue Number among VISIBLE items
+			if foundIdx == -1 {
+				for idx, item := range visibleItems {
+					if item.task != nil && item.task.Number == targetNum {
+						foundIdx = idx
+						foundTask = item.task
+						break
+					}
+				}
+			}
+
+			if foundIdx != -1 {
+				m.TaskCursor = foundIdx
+				if foundTask != nil {
+					m.StatusMsg = fmt.Sprintf("Moved to task [%d] #%d", targetNum, foundTask.Number)
+				} else {
+					m.StatusMsg = fmt.Sprintf("Moved to item [%d]", targetNum)
+				}
+				m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			} else {
+				m.StatusMsg = fmt.Sprintf("Task [%d] not found or collapsed", targetNum)
+				m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			}
+			return m, nil
+
+		case "esc":
+			m.TaskLeaderMode = TaskLeaderNone
+			m.TaskGoBuffer = ""
+			m.StatusMsg = "Cancelled go to task"
+			m.StatusMsgTimer = time.Now().Add(1500 * time.Millisecond)
+			return m, nil
+
+		default:
+			m.StatusMsg = fmt.Sprintf("Go to task: %s (digits, [Enter], [f]irst, [l]ast, [Esc] cancel)", m.TaskGoBuffer)
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+		}
+	}
+
 	// 3. Normal Task Navigation & Actions
 	switch msg.String() {
 	case "up", "k":
@@ -749,7 +978,7 @@ func (m Model) handleTasksKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.TaskCursor = 0
 		}
 
-	case "home", "g":
+	case "home":
 		m.TaskCursor = 0
 
 	case "end", "G":
@@ -757,37 +986,31 @@ func (m Model) handleTasksKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.TaskCursor = totalRows - 1
 		}
 
-	case "left", "right", "h", "l", "[", "]":
-		// Switch between My Tasks and Squad Tasks
-		if m.isSquadTasks() {
-			m.ActiveTab = TabMyTasks
-			m.ActiveTaskSubtab = TaskSubtabMine
-		} else {
-			m.ActiveTab = TabSquadTasks
-			m.ActiveTaskSubtab = TaskSubtabSquad
-		}
+	case "left", "h", "[":
+		// Jump to top of My Tasks
 		m.TaskCursor = 0
 		return m, nil
 
-	case "a":
-		// Add new task inline
-		m.InlineAdding = true
-		m.InlineNewNotes = ""
-		m.InlineNewPriority = github.PriorityMedium
-		if m.isSquadTasks() {
-			m.InlineNewAssignee = ""
-			reviews, _ := m.getSquadPartitionedTasks()
-			m.TaskCursor = len(reviews)
-		} else {
-			m.InlineNewAssignee = m.AuthUser
-			m.TaskCursor = 0
+	case "right", "l", "]":
+		// Jump to top of Squad Tasks
+		personalCount := len(m.getSortedPersonalTasks())
+		if totalRows > personalCount {
+			m.TaskCursor = personalCount
 		}
-		ti := textinput.New()
-		ti.Placeholder = "What needs to be done? (Enter to create, Esc to cancel)"
-		ti.Prompt = ""
-		ti.Focus()
-		m.InlineNewTitleInput = ti
-		return m, textinput.Blink
+		return m, nil
+
+	case "a":
+		m.TaskLeaderMode = TaskLeaderCreate
+		m.StatusMsg = "Add Task: [s] Squad Task  •  [m] My Task  •  [Esc] Cancel"
+		m.StatusMsgTimer = time.Now().Add(4 * time.Second)
+		return m, nil
+
+	case "g":
+		m.TaskLeaderMode = TaskLeaderGo
+		m.TaskGoBuffer = ""
+		m.StatusMsg = "Go to Task: [f] First  •  [l] Last  •  Type Number + [Enter]  •  [Esc] Cancel"
+		m.StatusMsgTimer = time.Now().Add(5 * time.Second)
+		return m, nil
 
 	case "enter", "e":
 		loc, task := m.getCursorTarget()
@@ -1015,6 +1238,39 @@ func (m Model) handleTasksKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Open Completed Tasks modal
 		m.ActiveModal = ModalCompletedTasks
 		m.CompletedTasksCursor = 0
+		return m, nil
+
+	case "D":
+		m.TaskCollapseCompleted = !m.TaskCollapseCompleted
+		if m.TaskCollapseCompleted {
+			m.StatusMsg = "Collapsed completed tasks"
+		} else {
+			m.StatusMsg = "Expanded completed tasks"
+		}
+		m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+		visibleCount := len(m.getVisibleTaskItems())
+		if m.TaskCursor >= visibleCount && visibleCount > 0 {
+			m.TaskCursor = visibleCount - 1
+		}
+		return m, nil
+
+	case "z":
+		visibleItems := m.getVisibleTaskItems()
+		if len(visibleItems) > 0 && m.TaskCursor < len(visibleItems) {
+			sec := visibleItems[m.TaskCursor].section
+			switch sec {
+			case "personal":
+				m.TaskCollapsePersonal = !m.TaskCollapsePersonal
+			case "squad":
+				m.TaskCollapseSquad = !m.TaskCollapseSquad
+			case "completed":
+				m.TaskCollapseCompleted = !m.TaskCollapseCompleted
+			}
+			visibleCount := len(m.getVisibleTaskItems())
+			if m.TaskCursor >= visibleCount && visibleCount > 0 {
+				m.TaskCursor = visibleCount - 1
+			}
+		}
 		return m, nil
 
 	case "i":

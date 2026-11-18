@@ -545,4 +545,66 @@ func TestSelectSquadModal_RetainsCommitHistoryAndTasksInstantaneously(t *testing
 	}
 }
 
+func TestManageSquadModal_Organizations(t *testing.T) {
+	m := createTestModelWithSquadAndStatus()
+
+	// 1. Open Manage Squad modal
+	res, _ := m.handleSquadKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("m")})
+	m = res.(Model)
+
+	overview := m.renderManageSquadModal()
+	if !strings.Contains(overview, "Organizations:") {
+		t.Fatalf("expected overview to show Organizations header, got:\n%s", overview)
+	}
+
+	// 2. Press 'o' to enter Add Organization mode
+	res, _ = m.handleManageSquadModalKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	m = res.(Model)
+	if m.SquadManageMode != SquadModeAddOrg {
+		t.Fatalf("expected SquadModeAddOrg, got %d", m.SquadManageMode)
+	}
+
+	m.ModalInput.SetValue("bronners-org")
+	res, _ = m.handleManageSquadModalKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(Model)
+
+	squad := m.Config.GetActiveSquad()
+	foundOrg := false
+	for _, o := range squad.Organizations {
+		if o == "bronners-org" {
+			foundOrg = true
+			break
+		}
+	}
+	if !foundOrg {
+		t.Fatalf("expected bronners-org to be added to squad organizations: %v", squad.Organizations)
+	}
+
+	// 3. Press 'O' to enter Remove Organization mode
+	res, _ = m.handleManageSquadModalKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("O")})
+	m = res.(Model)
+	if m.SquadManageMode != SquadModeRemoveOrg {
+		t.Fatalf("expected SquadModeRemoveOrg, got %d", m.SquadManageMode)
+	}
+
+	// Select first organization (bronners-org) with Space
+	m.ModalCursor = 0
+	res, _ = m.handleManageSquadModalKeys(tea.KeyMsg{Type: tea.KeySpace})
+	m = res.(Model)
+	if !m.SelectedSquadMembers["bronners-org"] {
+		t.Fatalf("expected bronners-org to be selected for removal")
+	}
+
+	// Confirm removal
+	res, _ = m.handleManageSquadModalKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(Model)
+
+	squad = m.Config.GetActiveSquad()
+	for _, o := range squad.Organizations {
+		if o == "bronners-org" {
+			t.Fatalf("expected bronners-org to be removed from squad organizations: %v", squad.Organizations)
+		}
+	}
+}
+
 

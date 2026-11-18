@@ -18,8 +18,10 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"grubby/internal/config"
+	"grubby/internal/eventbus"
 	"grubby/internal/git"
 	"grubby/internal/github"
+	"grubby/internal/protocol"
 	"grubby/internal/search"
 	"grubby/internal/storage"
 )
@@ -29,14 +31,31 @@ type TabType int
 const (
 	TabRepos TabType = iota
 	TabPRs
-	TabMyTasks
-	TabSquadTasks
+	TabTasks
 	TabSquad
 	TabSearch
 	TabStatus
 
-	// Backward compatibility alias
-	TabTasks = TabMyTasks
+	// Backward compatibility aliases
+	TabMyTasks    = TabTasks
+	TabSquadTasks = TabTasks
+)
+
+type TaskLeaderType int
+
+const (
+	TaskLeaderNone TaskLeaderType = iota
+	TaskLeaderCreate // triggered by 'a' -> wait for 's' (squad) or 'm' (mine)
+	TaskLeaderGo     // triggered by 'g' -> wait for 'f' (first), 'l' (last), or number + Enter
+)
+
+type RepoLeaderType int
+
+const (
+	RepoLeaderNone RepoLeaderType = iota
+	RepoLeaderFilter // triggered by 'f' -> wait for 'n' (name), 'l' (label), 's' (squad)
+	RepoLeaderOpen   // triggered by 'o' -> wait for 'w'/'c' (web), 'e' (editor), 's' (session), 'p' (PRs), 'i' (issues), 'a' (actions), 'd' (security), 'r' (releases), 'n' (pulse)
+	RepoLeaderYank   // triggered by 'y' -> same options as Open except 'e'
 )
 
 type ModalType int
@@ -217,6 +236,7 @@ type Model struct {
 	RawAvatarCache      map[string][]byte            // login -> raw image bytes for iTerm2 native graphics
 	ProfileCache        map[string]github.OrgMember  // login -> enriched profile (id, name, avatarUrl)
 	SeenNotificationIDs map[string]bool
+	SeenPRNotifications map[string]bool
 	GitStatuses         map[string]git.RepoGitStatus
 	RateLimit           github.RateLimitInfo
 	Loading             bool
@@ -237,6 +257,11 @@ type Model struct {
 	PrevComponentStatuses map[string]string
 	StatusCursor          int
 
+	// Reactive Event Bus & Webhooks
+	EventBus           *eventbus.Bus
+	EventSub           *eventbus.Subscription
+	EntityFlashUpdates map[string]time.Time
+
 	// Splash Screen & Tier Tree
 	SplashDismissed  bool
 	CollapsedTiers   map[storage.RepoTier]bool
@@ -252,6 +277,8 @@ type Model struct {
 
 	// Navigation & Cursors
 	RepoCursor              int
+	RepoLeaderMode          RepoLeaderType
+	ExpandedRepoPRs         map[string]bool
 	RepoFilter              string
 	RepoGroupFilter         string
 	SquadFilterActive       bool
@@ -273,6 +300,11 @@ type Model struct {
 	ActiveTaskSubtab       TaskSubtab
 	TaskShowDone           bool
 	TaskCursor             int
+	TaskLeaderMode         TaskLeaderType
+	TaskGoBuffer           string
+	TaskCollapsePersonal   bool
+	TaskCollapseSquad      bool
+	TaskCollapseCompleted  bool
 	TaskCreateTarget       TaskTarget
 	TaskCreateTitleInput   textinput.Model
 	TaskCreateBodyInput    textarea.Model
@@ -429,6 +461,7 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 		GitStatuses:           make(map[string]git.RepoGitStatus),
 		SecuritySummaries:     make(map[string]github.SecurityAlertSummary),
 		SeenNotificationIDs:   make(map[string]bool),
+		SeenPRNotifications:   make(map[string]bool),
 		RawAvatarCache:        make(map[string][]byte),
 		ProfileCache:          make(map[string]github.OrgMember),
 		RepoTiers:             make(map[string]storage.RepoTier),
@@ -459,6 +492,9 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 		RepoLabelsByName:      make(map[string][]string),
 		RepoLabelColors:       make(map[string]string),
 		HiddenRepos:           make(map[string]bool),
+		EntityFlashUpdates:    make(map[string]time.Time),
+		TaskCollapseCompleted: true,
+		ExpandedRepoPRs:       make(map[string]bool),
 	}
 
 	if cfg != nil {
@@ -499,11 +535,27 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 
 		// Eagerly read SQLite data for instantaneous UI render
 		if cachedRepos, err := db.GetRepositories(); err == nil && len(cachedRepos) > 0 {
-			m.Repos = cachedRepos
+			var validRepos []github.Repository
+			seenCache := make(map[string]bool)
+			for _, r := range cachedRepos {
+				canon := strings.ToLower(r.FullName)
+				if canon == "" {
+					canon = strings.ToLower(r.Owner + "/" + r.Name)
+				}
+				if seenCache[canon] {
+					continue
+				}
+				seenCache[canon] = true
+				validRepos = append(validRepos, r)
+			}
+			m.Repos = validRepos
 			m.RepoTiers = db.GetAllRepoTiers()
 			m.RepoInteractions = db.GetAllRepoInteractions()
 			if cachedPRs, err := db.GetPullRequests(); err == nil {
 				m.PRs = cachedPRs
+				for _, pr := range cachedPRs {
+					m.SeenPRNotifications[fmt.Sprintf("%s#%d", pr.DisplayRepo(), pr.Number)] = true
+				}
 			}
 			if pTasks, err := db.GetTasks(false, "open"); err == nil {
 				m.PersonalTasks = pTasks
@@ -564,8 +616,39 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 	return m
 }
 
+func (m *Model) SetEventBus(bus *eventbus.Bus) {
+	m.EventBus = bus
+	if bus != nil {
+		m.EventSub = bus.Subscribe(nil)
+	}
+}
+
+func (m *Model) recordEntityFlash(key string) {
+	if m.EntityFlashUpdates == nil {
+		m.EntityFlashUpdates = make(map[string]time.Time)
+	}
+	m.EntityFlashUpdates[strings.ToLower(key)] = time.Now()
+}
+
+func (m Model) isEntityFlashing(key string) (bool, lipgloss.Color) {
+	if m.EntityFlashUpdates == nil {
+		return false, ""
+	}
+	t, ok := m.EntityFlashUpdates[strings.ToLower(key)]
+	if !ok {
+		return false, ""
+	}
+	age := time.Since(t)
+	if age < 1200*time.Millisecond {
+		return true, lipgloss.Color("#1B4D2E") // vibrant subtle green
+	} else if age < 3000*time.Millisecond {
+		return true, lipgloss.Color("#0F2B19") // fading subtle green
+	}
+	return false, ""
+}
+
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.loadDataCmd(),
 		m.fetchGitHubStatusCmd(),
 		textinput.Blink,
@@ -575,7 +658,11 @@ func (m Model) Init() tea.Cmd {
 		tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 			return SplashDoneMsg{}
 		}),
-	)
+	}
+	if m.EventSub != nil {
+		cmds = append(cmds, listenForEventsCmd(m.EventSub))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) fetchGitHubStatusCmd() tea.Cmd {
@@ -600,9 +687,65 @@ func (m Model) loadDataCmd() tea.Cmd {
 			authUser = m.CurrentOrg
 		}
 
-		repos, prs, commitEvents, secAlerts, err := m.GHClient.FetchRepositoriesAndPRs(ctx, m.CurrentOrg)
-		if err != nil {
-			return DataLoadedMsg{Err: err}
+		squadOrgs := m.Config.GetActiveSquadOrgs()
+		if len(squadOrgs) == 0 {
+			if m.CurrentOrg != "" {
+				squadOrgs = []string{m.CurrentOrg}
+			} else {
+				squadOrgs = []string{authUser}
+			}
+		}
+
+		var repos []github.Repository
+		var prs []github.PullRequest
+		var commitEvents []github.SquadEvent
+		secAlerts := make(map[string]github.SecurityAlertSummary)
+		var lastErr error
+		successCount := 0
+
+		seenRepos := make(map[string]bool)
+		seenRepoIDs := make(map[int64]bool)
+		seenPRs := make(map[string]bool)
+
+		for _, org := range squadOrgs {
+			oRepos, oPrs, oCommits, oSec, err := m.GHClient.FetchRepositoriesAndPRs(ctx, org)
+			if err == nil {
+				successCount++
+				for _, r := range oRepos {
+					canon := strings.ToLower(r.FullName)
+					if canon == "" {
+						canon = strings.ToLower(r.Owner + "/" + r.Name)
+					}
+					if seenRepos[canon] {
+						continue
+					}
+					if r.ID > 0 && seenRepoIDs[r.ID] {
+						continue
+					}
+					seenRepos[canon] = true
+					if r.ID > 0 {
+						seenRepoIDs[r.ID] = true
+					}
+					repos = append(repos, r)
+				}
+				for _, p := range oPrs {
+					key := fmt.Sprintf("%s#%d", strings.ToLower(p.DisplayRepo()), p.Number)
+					if !seenPRs[key] {
+						seenPRs[key] = true
+						prs = append(prs, p)
+					}
+				}
+				commitEvents = append(commitEvents, oCommits...)
+				for k, v := range oSec {
+					secAlerts[k] = v
+				}
+			} else {
+				lastErr = err
+			}
+		}
+
+		if successCount == 0 && lastErr != nil {
+			return DataLoadedMsg{Err: lastErr}
 		}
 
 		// Fetch squad activity
@@ -621,10 +764,18 @@ func (m Model) loadDataCmd() tea.Cmd {
 		notifs, _ := m.GHClient.FetchNotifications(ctx)
 
 		// Fetch organization members and merge with unique actors
-		orgMembers, _ := m.GHClient.FetchOrgMembers(ctx, m.CurrentOrg)
+		var orgMembers []github.OrgMember
 		seenMembers := make(map[string]bool)
-		for _, om := range orgMembers {
-			seenMembers[strings.ToLower(om.Login)] = true
+		for _, org := range squadOrgs {
+			if oms, err := m.GHClient.FetchOrgMembers(ctx, org); err == nil {
+				for _, om := range oms {
+					lower := strings.ToLower(om.Login)
+					if !seenMembers[lower] {
+						seenMembers[lower] = true
+						orgMembers = append(orgMembers, om)
+					}
+				}
+			}
 		}
 		for _, ce := range commitEvents {
 			if ce.Actor != "" && !seenMembers[strings.ToLower(ce.Actor)] {
@@ -693,6 +844,9 @@ func (m Model) loadDataCmd() tea.Cmd {
 		if len(loadedSquads) > 0 {
 			for _, s := range loadedSquads {
 				_ = m.Config.CreateSquad(s.Name, s.DisplayName, s.Members)
+				if len(s.Organizations) > 0 {
+					_ = m.Config.SetSquadOrgs(s.Name, s.Organizations)
+				}
 				if len(s.Repos) > 0 {
 					_ = m.Config.SetSquadRepos(s.Name, s.Repos)
 				}
@@ -742,6 +896,13 @@ func (m Model) loadDataCmd() tea.Cmd {
 
 		if m.DB != nil {
 			_ = m.DB.SaveRepositories(repos, m.CurrentOrg)
+			var keepFullNames []string
+			for _, r := range repos {
+				if r.FullName != "" {
+					keepFullNames = append(keepFullNames, r.FullName)
+				}
+			}
+			_ = m.DB.PruneRepositoriesForOrgs(squadOrgs, keepFullNames)
 			_ = m.DB.SavePullRequests(prs)
 			_ = m.DB.UpdateRepoTiers(prs, events)
 			_ = m.DB.SaveTasks(append(append([]github.Task{}, personalTasks...), personalDoneTasks...), false, "synced")
@@ -1127,6 +1288,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.SplashDismissed = true
 		return m, nil
 
+	case EntityEventMsg:
+		var cmd tea.Cmd
+		m, cmd = m.handleEntityEvent(protocol.EventEnvelope(msg))
+		if cmd != nil {
+			return m, tea.Batch(cmd, listenForEventsCmd(m.EventSub))
+		}
+		return m, listenForEventsCmd(m.EventSub)
+
 	case AutoRefreshTickMsg:
 		m.TmuxSessions = GetTmuxSessions()
 		var cmds []tea.Cmd
@@ -1142,8 +1311,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.fetchGitHubStatusCmd())
 		}
 
-		// Auto-refresh main GitHub data every 5 minutes
-		if time.Since(m.LastRefreshTime) >= 5*time.Minute && !m.Loading {
+		// Auto-refresh main GitHub data every 5 minutes ONLY when webhooks are not active
+		if m.EventSub == nil && time.Since(m.LastRefreshTime) >= 5*time.Minute && !m.Loading {
 			m.Loading = true
 			m.LastRefreshTime = time.Now()
 			inactiveSkipped := 0
@@ -1352,6 +1521,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Repos = msg.Repos
 		}
 		if msg.PRs != nil {
+			if len(m.SeenPRNotifications) == 0 {
+				if m.SeenPRNotifications == nil {
+					m.SeenPRNotifications = make(map[string]bool)
+				}
+				for _, pr := range msg.PRs {
+					m.SeenPRNotifications[fmt.Sprintf("%s#%d", pr.DisplayRepo(), pr.Number)] = true
+				}
+			}
 			m.PRs = msg.PRs
 		}
 		if msg.SquadEvents != nil {
@@ -1447,12 +1624,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Notifications = msg.Notifications
 
 		if len(newNotifs) > 0 {
-			if len(newNotifs) == 1 {
-				n := newNotifs[0]
-				SendNativeNotification("Grubby • GitHub Notification", n.Repository, fmt.Sprintf("[%s] %s", n.Type, n.Title))
-			} else {
-				first := newNotifs[0]
-				SendNativeNotification("Grubby • GitHub Notifications", fmt.Sprintf("%d New Notifications", len(newNotifs)), fmt.Sprintf("%s: %s", first.Repository, first.Title))
+			for _, n := range newNotifs {
+				if strings.EqualFold(n.Type, "PullRequest") {
+					var matchedPR *github.PullRequest
+					for _, pr := range m.PRs {
+						if strings.EqualFold(pr.Title, n.Title) ||
+							(n.URL != "" && strings.HasSuffix(n.URL, fmt.Sprintf("/pulls/%d", pr.Number))) {
+							pCopy := pr
+							matchedPR = &pCopy
+							break
+						}
+					}
+					if matchedPR != nil {
+						SendPRNotification(*matchedPR)
+					} else {
+						SendPRNotification(github.PullRequest{
+							Title: n.Title,
+							Repo:  n.Repository,
+							URL:   n.URL,
+						})
+					}
+				} else {
+					SendNativeNotification("🧌 Grubby • Notification", n.Repository, fmt.Sprintf("[%s] %s", n.Type, n.Title))
+				}
 			}
 
 			// Automatically mark popped-up notifications as read
@@ -1809,9 +2003,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleSearchKeys(msg)
 		}
 
-		// When editing or adding a task inline, route keystrokes directly to task keys (disabling global hotkeys)
-		if m.isTasksTab() && (m.InlineEditing || m.InlineAdding) {
+		// When editing or adding a task inline, or in task leader mode, route keystrokes directly to task keys
+		if m.isTasksTab() && (m.InlineEditing || m.InlineAdding || m.TaskLeaderMode != TaskLeaderNone) {
 			return m.handleTasksKeys(msg)
+		}
+
+		// When in repo leader mode, route keystrokes directly to repo keys
+		if m.ActiveTab == TabRepos && m.RepoLeaderMode != RepoLeaderNone {
+			return m.handleReposKeys(msg)
 		}
 
 		// Global Key Handling (only active when not typing in an input field)
@@ -1827,39 +2026,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ActiveTab = TabPRs
 			return m, nil
 		case "3":
-			m.ActiveTab = TabMyTasks
-			m.ActiveTaskSubtab = TaskSubtabMine
+			m.ActiveTab = TabTasks
 			return m, nil
 		case "4":
-			m.ActiveTab = TabSquadTasks
-			m.ActiveTaskSubtab = TaskSubtabSquad
-			return m, nil
-		case "5":
 			m.ActiveTab = TabSquad
 			return m, m.emitSquadMemberAvatarsCmd()
-		case "6":
+		case "5":
 			m.ActiveTab = TabSearch
 			return m, nil
-		case "7":
+		case "6", "7":
 			m.ActiveTab = TabStatus
 			return m, nil
 		case "tab":
-			m.ActiveTab = (m.ActiveTab + 1) % 7
-			if m.ActiveTab == TabMyTasks {
-				m.ActiveTaskSubtab = TaskSubtabMine
-			} else if m.ActiveTab == TabSquadTasks {
-				m.ActiveTaskSubtab = TaskSubtabSquad
-			} else if m.ActiveTab == TabSquad {
+			m.ActiveTab = (m.ActiveTab + 1) % 6
+			if m.ActiveTab == TabSquad {
 				return m, m.emitSquadMemberAvatarsCmd()
 			}
 			return m, nil
 		case "shift+tab":
-			m.ActiveTab = (m.ActiveTab + 6) % 7
-			if m.ActiveTab == TabMyTasks {
-				m.ActiveTaskSubtab = TaskSubtabMine
-			} else if m.ActiveTab == TabSquadTasks {
-				m.ActiveTaskSubtab = TaskSubtabSquad
-			} else if m.ActiveTab == TabSquad {
+			m.ActiveTab = (m.ActiveTab + 5) % 6
+			if m.ActiveTab == TabSquad {
 				return m, m.emitSquadMemberAvatarsCmd()
 			}
 			return m, nil
@@ -1881,7 +2067,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleReposKeys(msg)
 		case TabPRs:
 			return m.handlePRsKeys(msg)
-		case TabMyTasks, TabSquadTasks:
+		case TabTasks:
 			return m.handleTasksKeys(msg)
 		case TabSquad:
 			return m.handleSquadKeys(msg)
@@ -1923,7 +2109,7 @@ func (m Model) View() string {
 		body = m.renderReposView()
 	case TabPRs:
 		body = m.renderPRsView()
-	case TabMyTasks, TabSquadTasks:
+	case TabTasks:
 		body = m.renderTasksView()
 	case TabSquad:
 		body = m.renderSquadView()
@@ -1977,43 +2163,38 @@ func (m Model) renderTopBar() string {
 
 	mineOpen := len(m.PersonalTasks)
 	squadOpen := len(m.SquadTasks)
+	totalTasks := mineOpen + squadOpen
 
 	var tabs []string
-	if m.Width >= 145 {
+	if m.Width >= 135 {
 		tabs = []string{
 			"1: Repositories",
 			fmt.Sprintf("2: Pull Requests (%d)", len(m.PRs)),
-			fmt.Sprintf("3: My Tasks (%d)", mineOpen),
-			fmt.Sprintf("4: Squad Tasks (%d)", squadOpen),
-			"5: Squad Activity",
-			"6: Code Search",
-			fmt.Sprintf("7: Status %s", statusDot),
+			fmt.Sprintf("3: Tasks (%d)", totalTasks),
+			"4: Squad Activity",
+			"5: Code Search",
+			fmt.Sprintf("6: Status %s", statusDot),
 		}
-	} else if m.Width >= 115 {
+	} else if m.Width >= 105 {
 		prCountStr := ""
 		if len(m.PRs) > 0 {
 			prCountStr = fmt.Sprintf(" (%d)", len(m.PRs))
 		}
-		mineCountStr := ""
-		if mineOpen > 0 {
-			mineCountStr = fmt.Sprintf(" (%d)", mineOpen)
-		}
-		squadCountStr := ""
-		if squadOpen > 0 {
-			squadCountStr = fmt.Sprintf(" (%d)", squadOpen)
+		tasksCountStr := ""
+		if totalTasks > 0 {
+			tasksCountStr = fmt.Sprintf(" (%d)", totalTasks)
 		}
 		tabs = []string{
 			"1: Repos",
 			fmt.Sprintf("2: PRs%s", prCountStr),
-			fmt.Sprintf("3: My Tasks%s", mineCountStr),
-			fmt.Sprintf("4: Squad Tasks%s", squadCountStr),
-			"5: Squad",
-			"6: Search",
-			fmt.Sprintf("7: Status %s", statusDot),
+			fmt.Sprintf("3: Tasks%s", tasksCountStr),
+			"4: Squad",
+			"5: Search",
+			fmt.Sprintf("6: Status %s", statusDot),
 		}
 	} else {
 		tabs = []string{
-			"1: Repos", "2: PRs", "3: My Tasks", "4: Squad Tasks", "5: Squad", "6: Search", fmt.Sprintf("7: %s", statusDot),
+			"1: Repos", "2: PRs", "3: Tasks", "4: Squad", "5: Search", fmt.Sprintf("6: %s", statusDot),
 		}
 	}
 
@@ -2151,18 +2332,30 @@ func (m Model) renderFooter() string {
 	var help string
 	switch m.ActiveTab {
 	case TabRepos:
-		items := m.getRepoTableItems()
-		isTierHeader := false
-		if len(items) > 0 && m.RepoCursor >= 0 && m.RepoCursor < len(items) {
-			isTierHeader = items[m.RepoCursor].Kind == ItemTierHeader
-		}
-
-		if isTierHeader {
-			help = "[Space/Enter] Toggle Tier  [Left/h] Collapse  [Right/l] Expand  [C] Collapse All  [E] Expand All  [j/k] Navigate  [?] Help"
-		} else if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortVulnerabilities || m.SquadFilterActive {
-			help = "[p] PRs  [/] Filter  [#] Labels  [S] Squad Filter  [v] Sort Vulns  [s] Session  [e] Editor  [t] Shell  [Left] Tier  [Esc] Clear  [Enter] Web  [o] Submenu  [O] Claim  [l] Labels  [c] Clone  [?] Help"
+		if m.RepoLeaderMode == RepoLeaderFilter {
+			help = "Filter: [n] Name  [l] Label  [s] Squad  [Esc] Clear/Cancel"
+		} else if m.RepoLeaderMode == RepoLeaderOpen {
+			help = "Open: [w/c] Web  [e] Editor  [s] Session  [p] PRs  [i] Issues  [a] Actions  [d] Security  [r] Releases  [Esc] Cancel"
+		} else if m.RepoLeaderMode == RepoLeaderYank {
+			help = "Yank: [w/c] Web URL  [s] Session  [p] PRs URL  [i] Issues URL  [a] Actions URL  [d] Security URL  [r] Releases URL  [Esc] Cancel"
 		} else {
-			help = "[p] PRs  [/] Filter  [#] Labels  [S] Squad Filter  [v] Sort Vulns  [s] Session  [e] Editor  [t] Shell  [Left] Tier  [Enter] Web  [o] Submenu  [O] Claim  [l] Labels  [c] Clone  [u] Sync  [?] Help"
+			items := m.getRepoTableItems()
+			isTierHeader := false
+			isPRItem := false
+			if len(items) > 0 && m.RepoCursor >= 0 && m.RepoCursor < len(items) {
+				isTierHeader = items[m.RepoCursor].Kind == ItemTierHeader
+				isPRItem = items[m.RepoCursor].Kind == ItemRepoPR
+			}
+
+			if isTierHeader {
+				help = "[Space/Enter] Toggle Tier  [Left/h] Collapse  [Right/l] Expand  [Z] Collapse All  [E] Expand All  [j/k] Navigate  [?] Help"
+			} else if isPRItem {
+				help = "[Enter/o] Open PR  [y] Yank PR URL  [Left/h] Parent Repo  [C] Claim  [j/k] Navigate  [?] Help"
+			} else if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortVulnerabilities || m.SquadFilterActive {
+				help = "[Enter] Toggle PRs  [f] Filter (n/l/s)  [o] Open (w/e/s/p/i)  [y] Yank  [C] Claim  [c] Clone  [l] Label  [Esc] Clear  [?] Help"
+			} else {
+				help = "[Enter] Toggle PRs  [f] Filter (n/l/s)  [o] Open (w/e/s/p/i)  [y] Yank  [C] Claim  [c] Clone  [l] Label  [v] Vulns  [?] Help"
+			}
 		}
 	case TabPRs:
 		if m.PRFilter != "" {
@@ -2170,30 +2363,21 @@ func (m Model) renderFooter() string {
 		} else {
 			help = "[m] Merge  [f] Filter  [t] Request Review  [y] Yank URL  [o] Browser  [p] Copilot Review  [c] Checkout Branch  [r] Refresh  [?] Help"
 		}
-	case TabMyTasks:
-		if m.InlineAdding {
+	case TabTasks:
+		if m.TaskLeaderMode == TaskLeaderCreate {
+			help = "Add Task: [s] Squad Task  [m] My Task  [Esc] Cancel"
+		} else if m.TaskLeaderMode == TaskLeaderGo {
+			help = fmt.Sprintf("Go to Task: [f] First  [l] Last  Number [%s] + [Enter]  [Esc] Cancel", m.TaskGoBuffer)
+		} else if m.InlineAdding {
 			help = "[Enter] Create Task  [Esc] Cancel  [ctrl+n] Notes  [ctrl+p] Priority"
 		} else if m.InlineEditing {
 			help = "[Enter] Save Title  [Esc] Cancel"
 		} else {
 			_, cursorTask := m.getCursorTarget()
 			if cursorTask != nil && cursorTask.IsPRReview() {
-				help = "[Enter/o] Open PR  [i] Issue  [Space] Toggle Done  [n] Notes  [p] Priority  [c] Assign  [d] All Done  [a] Add  [?] Help"
+				help = "[a] Add Task (s/m)  [g] Go to (#/f/l)  [Enter/o] Open PR  [Space] Done  [D] Toggle Done Sec  [n] Notes  [p] Priority  [c/A] Assign  [d] All Done  [?] Help"
 			} else {
-				help = "[a] Add  [Enter] Edit Title  [Space] Toggle Done  [n] Notes  [p] Priority  [c] Assign  [d] All Done  [i/o] Issue  [?] Help"
-			}
-		}
-	case TabSquadTasks:
-		if m.InlineAdding {
-			help = "[Enter] Create Task  [Esc] Cancel  [ctrl+n] Notes  [ctrl+p] Priority  [Tab] Assignee"
-		} else if m.InlineEditing {
-			help = "[Enter] Save Title  [Esc] Cancel"
-		} else {
-			_, cursorTask := m.getCursorTarget()
-			if cursorTask != nil && cursorTask.IsPRReview() {
-				help = "[Enter/o] Open PR  [i] Issue  [Space] Toggle Done  [A] Assign  [n] Notes  [p] Priority  [c] Cycle  [d] All Done  [a] Add  [?] Help"
-			} else {
-				help = "[a] Add  [Enter] Edit Title  [Space] Toggle Done  [A] Assign  [n] Notes  [p] Priority  [c] Cycle  [d] All Done  [i/o] Issue  [?] Help"
+				help = "[a] Add Task (s/m)  [g] Go to (#/f/l)  [Enter] Edit Title  [Space] Done  [D] Toggle Done Sec  [n] Notes  [p] Priority  [c/A] Assign  [d] All Done  [?] Help"
 			}
 		}
 	case TabSquad:
@@ -2582,10 +2766,11 @@ func (m Model) syncSquadsFileCmd() tea.Cmd {
 	var squadDefs []github.SquadDefinition
 	for _, s := range m.Config.Squads {
 		squadDefs = append(squadDefs, github.SquadDefinition{
-			Name:        s.Name,
-			DisplayName: s.DisplayName,
-			Members:     s.Members,
-			Repos:       s.Repos,
+			Name:          s.Name,
+			DisplayName:   s.DisplayName,
+			Members:       s.Members,
+			Organizations: s.Organizations,
+			Repos:         s.Repos,
 		})
 	}
 	author := m.AuthUser

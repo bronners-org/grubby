@@ -115,13 +115,24 @@ func TestLiveFetchRepositoriesAndPRs(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	repos, prs, commitEvents, secMap, err := client.FetchRepositoriesAndPRs(ctx, "simonbronner")
+	targetOrg := "bronners-org"
+	repos, prs, commitEvents, secMap, err := client.FetchRepositoriesAndPRs(ctx, targetOrg)
 	if err != nil {
 		t.Fatalf("FetchRepositoriesAndPRs failed: %v", err)
 	}
 
 	if len(repos) == 0 {
-		t.Fatalf("expected repos, got 0")
+		t.Fatalf("expected repos for %s, got 0", targetOrg)
+	}
+
+	// Verify that fetching for a user whose repos were transferred to an org (simonbronner)
+	// returns 0 repos rather than misattributing the org's repos to the user.
+	userRepos, _, _, _, err := client.FetchRepositoriesAndPRs(ctx, "simonbronner")
+	if err != nil {
+		t.Fatalf("FetchRepositoriesAndPRs failed for simonbronner: %v", err)
+	}
+	if len(userRepos) != 0 {
+		t.Fatalf("expected 0 repos for simonbronner after transfer to bronners-org, got %d (e.g. %+v)", len(userRepos), userRepos[0])
 	}
 
 	// Verify open PRs are fetched properly
