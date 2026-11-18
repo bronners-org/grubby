@@ -103,28 +103,16 @@ func TestRepoTabsModal_ActsOnSelectedRepoNotFirst(t *testing.T) {
 	// Select third-repo
 	m.RepoCursor = thirdIdx
 
-	// Press 'o' -> opens ModalRepoTabs
+	// Press 'o' -> enters RepoLeaderOpen
 	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	m = updated.(Model)
-	if m.ActiveModal != ModalRepoTabs {
-		t.Fatalf("expected ActiveModal to be ModalRepoTabs")
-	}
-
-	// Render modal -> must mention third-repo, NOT first-repo!
-	view := m.renderRepoTabsModal()
-	if !strings.Contains(view, "third-repo") {
-		t.Errorf("expected modal title to mention third-repo, got:\n%s", view)
-	}
-	if strings.Contains(view, "first-repo") {
-		t.Errorf("modal should NOT mention first-repo, got:\n%s", view)
+	if m.RepoLeaderMode != RepoLeaderOpen {
+		t.Fatalf("expected RepoLeaderMode to be RepoLeaderOpen")
 	}
 
 	// Press 'p' for Pull Requests -> must act on third-repo
-	updatedP, cmdP := m.handleRepoTabsModalKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	updatedP, cmdP := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	m = updatedP.(Model)
-	if m.ActiveModal != ModalNone {
-		t.Errorf("expected modal to close")
-	}
 	if cmdP == nil {
 		t.Fatalf("expected toast cmd")
 	}

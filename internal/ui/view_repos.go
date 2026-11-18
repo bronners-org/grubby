@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -24,14 +25,60 @@ type RepoItemKind int
 const (
 	ItemTierHeader RepoItemKind = iota
 	ItemRepo
+	ItemRepoPR
 )
 
 type RepoTableItem struct {
 	Kind       RepoItemKind
 	Tier       storage.RepoTier
 	Repo       *github.Repository
+	PR         *github.PullRequest
 	ChildCount int
 	Expanded   bool
+}
+
+func (m Model) getPRsForRepo(repo *github.Repository) []github.PullRequest {
+	if repo == nil {
+		return nil
+	}
+	var res []github.PullRequest
+	for _, pr := range m.PRs {
+		if pr.RepoFullName != "" && repo.FullName != "" && strings.EqualFold(pr.RepoFullName, repo.FullName) {
+			res = append(res, pr)
+			continue
+		}
+		if pr.RepoOwner != "" && repo.Owner != "" && !strings.EqualFold(pr.RepoOwner, repo.Owner) {
+			continue
+		}
+		if strings.EqualFold(github.NormalizeRepoName(pr.Repo), github.NormalizeRepoName(repo.Name)) {
+			res = append(res, pr)
+		}
+	}
+	return res
+}
+
+func (m Model) isRepoPRExpanded(r *github.Repository) bool {
+	if r == nil || m.ExpandedRepoPRs == nil {
+		return false
+	}
+	if r.FullName != "" && m.ExpandedRepoPRs[strings.ToLower(r.FullName)] {
+		return true
+	}
+	return m.ExpandedRepoPRs[strings.ToLower(r.Name)]
+}
+
+func (m *Model) toggleRepoPRExpanded(r *github.Repository) {
+	if r == nil {
+		return
+	}
+	if m.ExpandedRepoPRs == nil {
+		m.ExpandedRepoPRs = make(map[string]bool)
+	}
+	key := strings.ToLower(r.Name)
+	if r.FullName != "" {
+		key = strings.ToLower(r.FullName)
+	}
+	m.ExpandedRepoPRs[key] = !m.ExpandedRepoPRs[key]
 }
 
 func (m Model) getRepoLabels(r *github.Repository) []string {
@@ -102,6 +149,9 @@ func (m Model) getSelectedRepo() *github.Repository {
 		if item.Kind == ItemRepo && item.Repo != nil {
 			return item.Repo
 		}
+		if item.Kind == ItemRepoPR && item.Repo != nil {
+			return item.Repo
+		}
 	}
 	return nil
 }
@@ -163,11 +213,27 @@ func (m Model) getRepoTableItems(reposOpt ...[]github.Repository) []RepoTableIte
 		})
 		if !collapsed {
 			for i := range list {
+				r := &list[i]
+				repoPRs := m.getPRsForRepo(r)
+				isExpanded := m.isRepoPRExpanded(r)
 				items = append(items, RepoTableItem{
-					Kind: ItemRepo,
-					Tier: tier,
-					Repo: &list[i],
+					Kind:       ItemRepo,
+					Tier:       tier,
+					Repo:       r,
+					ChildCount: len(repoPRs),
+					Expanded:   isExpanded,
 				})
+				if isExpanded && len(repoPRs) > 0 {
+					for j := range repoPRs {
+						prCopy := repoPRs[j]
+						items = append(items, RepoTableItem{
+							Kind: ItemRepoPR,
+							Tier: tier,
+							Repo: r,
+							PR:   &prCopy,
+						})
+					}
+				}
 			}
 		}
 	}
@@ -324,7 +390,207 @@ func (m Model) getDisplayRepos() []github.Repository {
 	return result
 }
 
+func (m Model) toggleRepoOwnership(repoName string) (tea.Model, tea.Cmd) {
+	if m.Config == nil || m.Config.ActiveSquad == "" {
+		return m, func() tea.Msg { return StatusToastMsg("No active squad configured") }
+	}
+	activeSquad := m.Config.ActiveSquad
+	nowOwned, err := m.Config.ToggleRepoOwnership(activeSquad, repoName)
+	if err != nil {
+		return m, func() tea.Msg { return StatusToastMsg("Error: " + err.Error()) }
+	}
+	if m.DB != nil {
+		var squadDefs []github.SquadDefinition
+		for _, s := range m.Config.Squads {
+			squadDefs = append(squadDefs, github.SquadDefinition{
+				Name:        s.Name,
+				DisplayName: s.DisplayName,
+				Members:     s.Members,
+				Repos:       s.Repos,
+			})
+		}
+		_ = m.DB.SaveSquads(squadDefs)
+	}
+	dispName := activeSquad
+	if s := m.Config.GetActiveSquad(); s != nil && s.DisplayName != "" {
+		dispName = s.DisplayName
+	}
+	toastText := fmt.Sprintf("✓ Assigned '%s' to squad '%s'", repoName, dispName)
+	if !nowOwned {
+		toastText = fmt.Sprintf("Removed '%s' from squad '%s'", repoName, dispName)
+	}
+	return m, tea.Batch(
+		func() tea.Msg { return StatusToastMsg(toastText) },
+		m.syncSquadsFileCmd(),
+	)
+}
+
 func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// 0. If in a leader mode, process the second keystroke
+	if m.RepoLeaderMode != RepoLeaderNone {
+		leader := m.RepoLeaderMode
+		m.RepoLeaderMode = RepoLeaderNone
+
+		if msg.String() == "esc" {
+			return m, nil
+		}
+
+		switch leader {
+		case RepoLeaderFilter:
+			switch msg.String() {
+			case "n":
+				m.ActiveModal = ModalFilterRepoName
+				m.RepoFilterInput.SetValue(m.RepoFilter)
+				m.RepoFilterInput.Focus()
+				return m, textinput.Blink
+			case "l":
+				m.ActiveModal = ModalFilterGroup
+				m.ModalCursor = 0
+				return m, nil
+			case "s":
+				if m.Config == nil || m.Config.ActiveSquad == "" {
+					return m, func() tea.Msg { return StatusToastMsg("No active squad selected") }
+				}
+				m.SquadFilterActive = !m.SquadFilterActive
+				m.RepoCursor = m.firstSelectableRepoIndex()
+				if m.SquadFilterActive {
+					squadName := m.Config.ActiveSquad
+					if s := m.Config.GetActiveSquad(); s != nil && s.DisplayName != "" {
+						squadName = s.DisplayName
+					}
+					return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Filtered repos owned by squad '%s'", squadName)) }
+				}
+				return m, func() tea.Msg { return StatusToastMsg("Cleared squad repo filter") }
+			default:
+				return m, nil
+			}
+
+		case RepoLeaderOpen:
+			repo := m.getSelectedRepo()
+			if repo == nil {
+				return m, nil
+			}
+			m = m.recordRepoInteraction(repo.Name)
+			m = m.focusRepoCursor(repo.Name)
+
+			switch msg.String() {
+			case "w", "c", "enter", "o":
+				_ = OpenBrowser(repo.URL)
+				return m, tea.Batch(
+					func() tea.Msg { return StatusToastMsg("Opened " + repo.FullName + " in dedicated browser") },
+					m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
+				)
+			case "e":
+				st := m.GitStatuses[repo.Name]
+				if st.IsCloned {
+					msgStr, err := OpenRepoEditor(repo.Name, st.LocalPath)
+					if err != nil {
+						return m, func() tea.Msg { return StatusToastMsg("Failed to open editor: " + err.Error()) }
+					}
+					return m, tea.Batch(
+						func() tea.Msg { return StatusToastMsg(msgStr) },
+						m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
+					)
+				}
+				return m.startCloneWithAction(*repo, RepoActionEditor)
+			case "s":
+				st := m.GitStatuses[repo.Name]
+				if st.IsCloned {
+					msgStr, err := GoToRepoSession(repo.Name, st.LocalPath)
+					if err != nil {
+						return m, func() tea.Msg { return StatusToastMsg("Failed to switch session: " + err.Error()) }
+					}
+					return m, tea.Batch(
+						func() tea.Msg { return StatusToastMsg(msgStr) },
+						m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
+					)
+				}
+				return m.startCloneWithAction(*repo, RepoActionSession)
+			case "p":
+				url := fmt.Sprintf("https://github.com/%s/pulls", repo.FullName)
+				_ = OpenBrowser(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened %s Pull Requests in browser", repo.Name)) }
+			case "i":
+				url := fmt.Sprintf("https://github.com/%s/issues", repo.FullName)
+				_ = OpenBrowser(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened %s Issues in browser", repo.Name)) }
+			case "a":
+				url := fmt.Sprintf("https://github.com/%s/actions", repo.FullName)
+				_ = OpenBrowser(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened %s Actions in browser", repo.Name)) }
+			case "d":
+				url := fmt.Sprintf("https://github.com/%s/security/dependabot", repo.FullName)
+				_ = OpenBrowser(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened %s Security in browser", repo.Name)) }
+			case "r":
+				url := fmt.Sprintf("https://github.com/%s/releases", repo.FullName)
+				_ = OpenBrowser(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened %s Releases in browser", repo.Name)) }
+			case "n":
+				url := fmt.Sprintf("https://github.com/%s/pulse", repo.FullName)
+				_ = OpenBrowser(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened %s Insights in browser", repo.Name)) }
+			case "t":
+				url := fmt.Sprintf("https://github.com/%s/settings", repo.FullName)
+				_ = OpenBrowser(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened %s Settings in browser", repo.Name)) }
+			default:
+				return m, nil
+			}
+
+		case RepoLeaderYank:
+			repo := m.getSelectedRepo()
+			if repo == nil {
+				return m, nil
+			}
+			m = m.recordRepoInteraction(repo.Name)
+			m = m.focusRepoCursor(repo.Name)
+
+			switch msg.String() {
+			case "w", "c", "enter", "y":
+				url := repo.URL
+				if url == "" {
+					url = fmt.Sprintf("https://github.com/%s", repo.FullName)
+				}
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s URL to clipboard: %s", repo.Name, url)) }
+			case "s":
+				_ = CopyToClipboard(repo.Name)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied session name '%s' to clipboard", repo.Name)) }
+			case "p":
+				url := fmt.Sprintf("https://github.com/%s/pulls", repo.FullName)
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s PRs URL to clipboard: %s", repo.Name, url)) }
+			case "i":
+				url := fmt.Sprintf("https://github.com/%s/issues", repo.FullName)
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s Issues URL to clipboard: %s", repo.Name, url)) }
+			case "a":
+				url := fmt.Sprintf("https://github.com/%s/actions", repo.FullName)
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s Actions URL to clipboard: %s", repo.Name, url)) }
+			case "d":
+				url := fmt.Sprintf("https://github.com/%s/security/dependabot", repo.FullName)
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s Security URL to clipboard: %s", repo.Name, url)) }
+			case "r":
+				url := fmt.Sprintf("https://github.com/%s/releases", repo.FullName)
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s Releases URL to clipboard: %s", repo.Name, url)) }
+			case "n":
+				url := fmt.Sprintf("https://github.com/%s/pulse", repo.FullName)
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s Insights URL to clipboard: %s", repo.Name, url)) }
+			case "t":
+				url := fmt.Sprintf("https://github.com/%s/settings", repo.FullName)
+				_ = CopyToClipboard(url)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Copied %s Settings URL to clipboard: %s", repo.Name, url)) }
+			default:
+				return m, nil
+			}
+		}
+	}
+
 	items := m.getRepoTableItems()
 
 	switch msg.String() {
@@ -368,6 +634,9 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(items) > 0 {
 			m.RepoCursor = len(items) - 1
 		}
+		return m, nil
+	case "f":
+		m.RepoLeaderMode = RepoLeaderFilter
 		return m, nil
 	case "/":
 		// '/' filter: filter repositories by name or label
@@ -425,7 +694,7 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 1. Key handling when cursor is on Tier Header
 	if currentItem.Kind == ItemTierHeader {
 		switch msg.String() {
-		case "enter", " ", "c":
+		case "enter", " ":
 			if m.CollapsedTiers == nil {
 				m.CollapsedTiers = make(map[storage.RepoTier]bool)
 			}
@@ -462,7 +731,16 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, func() tea.Msg {
 				return StatusToastMsg(fmt.Sprintf("Expanded %s tier", storage.TierName(currentItem.Tier)))
 			}
-		case "C":
+		case "E":
+			// Expand all tiers
+			if m.CollapsedTiers == nil {
+				m.CollapsedTiers = make(map[storage.RepoTier]bool)
+			}
+			for _, t := range []storage.RepoTier{storage.TierHot, storage.TierWarm, storage.TierCold, storage.TierDead, storage.TierHidden} {
+				m.CollapsedTiers[t] = false
+			}
+			return m, func() tea.Msg { return StatusToastMsg("Expanded all repository tiers") }
+		case "C", "Z":
 			// Collapse all tiers
 			if m.CollapsedTiers == nil {
 				m.CollapsedTiers = make(map[storage.RepoTier]bool)
@@ -475,56 +753,119 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.RepoCursor = len(newItems) - 1
 			}
 			return m, func() tea.Msg { return StatusToastMsg("Collapsed all repository tiers") }
-		case "E":
-			// Expand all tiers
-			if m.CollapsedTiers == nil {
-				m.CollapsedTiers = make(map[storage.RepoTier]bool)
-			}
-			for _, t := range []storage.RepoTier{storage.TierHot, storage.TierWarm, storage.TierCold, storage.TierDead, storage.TierHidden} {
-				m.CollapsedTiers[t] = false
-			}
-			return m, func() tea.Msg { return StatusToastMsg("Expanded all repository tiers") }
 		default:
 			return m, nil
 		}
 	}
 
-	// 2. Key handling when cursor is on a Repository row
+	// 2. Key handling when cursor is on a child Pull Request row
+	if currentItem.Kind == ItemRepoPR {
+		pr := *currentItem.PR
+		parentRepo := currentItem.Repo
+
+		switch msg.String() {
+		case "enter", "o":
+			if pr.URL != "" {
+				_ = OpenBrowser(pr.URL)
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Opened PR #%d in browser", pr.Number)) }
+			}
+			return m, nil
+		case "y":
+			if pr.URL != "" {
+				_ = CopyToClipboard(pr.URL)
+				return m, func() tea.Msg {
+					return StatusToastMsg(fmt.Sprintf("Copied PR #%d URL to clipboard: %s", pr.Number, pr.URL))
+				}
+			}
+			return m, nil
+		case "h", "left", "[":
+			// Jump cursor to parent repo row
+			items := m.getRepoTableItems()
+			for idx, it := range items {
+				if it.Kind == ItemRepo && it.Repo != nil && parentRepo != nil && strings.EqualFold(it.Repo.Name, parentRepo.Name) {
+					m.RepoCursor = idx
+					break
+				}
+			}
+			return m, nil
+		case "C", "O":
+			// Claim / toggle ownership of parent repo for active squad
+			if parentRepo != nil {
+				return m.toggleRepoOwnership(parentRepo.Name)
+			}
+			return m, nil
+		case "t":
+			// Request review / create PR task
+			m.ActiveModal = ModalCreatePRTask
+			m.PRTaskTarget = pr
+			m.PRTaskPriority = github.PriorityMedium
+			m.PRTaskFocusedField = 0
+			m.PRTaskActiveButton = 0
+			m.PRTaskMemberCursor = 0
+			m.PRTaskCandidates = m.getSquadMembersForReview(pr.Author)
+			m.PRTaskSelectedMembers = make(map[string]bool)
+			return m, nil
+		case "p":
+			// Request Copilot review
+			return m, func() tea.Msg {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				repoName := pr.Repo
+				if repoName == "" && parentRepo != nil {
+					repoName = parentRepo.Name
+				}
+				err := m.GHClient.TriggerCopilotReview(ctx, m.CurrentOrg, repoName, pr.Number)
+				if err != nil {
+					return StatusToastMsg(fmt.Sprintf("Failed to request Copilot review: %v", err))
+				}
+				return StatusToastMsg(fmt.Sprintf("Requested Copilot review for #%d in %s", pr.Number, repoName))
+			}
+		case "c":
+			// Checkout branch locally if cloned
+			if parentRepo != nil {
+				st := m.GitStatuses[parentRepo.Name]
+				if !st.IsCloned {
+					return m, func() tea.Msg { return StatusToastMsg("Repo " + parentRepo.Name + " is not cloned yet!") }
+				}
+				return m, func() tea.Msg {
+					cmd := exec.Command("gh", "pr", "checkout", fmt.Sprintf("%d", pr.Number))
+					cmd.Dir = st.LocalPath
+					err := cmd.Run()
+					if err != nil {
+						return StatusToastMsg(fmt.Sprintf("Failed to checkout PR #%d: %v", pr.Number, err))
+					}
+					return StatusToastMsg(fmt.Sprintf("Checked out PR #%d in %s", pr.Number, st.LocalPath))
+				}
+			}
+			return m, nil
+		default:
+			return m, nil
+		}
+	}
+
+	// 3. Key handling when cursor is on a Repository row
 	repo := *currentItem.Repo
 
 	switch msg.String() {
-	case "left":
-		// Jump cursor to parent tier header
-		items := m.getRepoTableItems()
-		for idx, it := range items {
-			if it.Kind == ItemTierHeader && it.Tier == currentItem.Tier {
-				m.RepoCursor = idx
-				break
-			}
-		}
+	case "o":
+		m.RepoLeaderMode = RepoLeaderOpen
 		return m, nil
-	case "C":
-		// Collapse all tiers
-		if m.CollapsedTiers == nil {
-			m.CollapsedTiers = make(map[storage.RepoTier]bool)
+	case "y":
+		m.RepoLeaderMode = RepoLeaderYank
+		return m, nil
+	case "enter", " ":
+		// Toggle PR expansion
+		if currentItem.ChildCount > 0 {
+			m.toggleRepoPRExpanded(&repo)
+			newItems := m.getRepoTableItems()
+			if m.RepoCursor >= len(newItems) {
+				m.RepoCursor = len(newItems) - 1
+			}
+			return m, nil
 		}
-		for _, t := range []storage.RepoTier{storage.TierHot, storage.TierWarm, storage.TierCold, storage.TierDead, storage.TierHidden} {
-			m.CollapsedTiers[t] = true
+		return m, func() tea.Msg {
+			return StatusToastMsg(fmt.Sprintf("No open pull requests for %s", repo.Name))
 		}
-		newItems := m.getRepoTableItems()
-		if m.RepoCursor >= len(newItems) {
-			m.RepoCursor = len(newItems) - 1
-		}
-		return m, func() tea.Msg { return StatusToastMsg("Collapsed all repository tiers") }
-	case "E":
-		// Expand all tiers
-		if m.CollapsedTiers == nil {
-			m.CollapsedTiers = make(map[storage.RepoTier]bool)
-		}
-		for _, t := range []storage.RepoTier{storage.TierHot, storage.TierWarm, storage.TierCold, storage.TierDead, storage.TierHidden} {
-			m.CollapsedTiers[t] = false
-		}
-		return m, func() tea.Msg { return StatusToastMsg("Expanded all repository tiers") }
 	case "h":
 		// Hide or unhide repository
 		isCurrentlyHidden := m.isRepoHidden(repo.Name)
@@ -551,8 +892,36 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, func() tea.Msg {
 			return StatusToastMsg(fmt.Sprintf("%s repository '%s'", actionDesc, repo.Name))
 		}
+	case "left":
+		// If PRs expanded, collapse them; otherwise jump cursor to parent tier header
+		if m.isRepoPRExpanded(&repo) {
+			m.toggleRepoPRExpanded(&repo)
+			return m, nil
+		}
+		items := m.getRepoTableItems()
+		for idx, it := range items {
+			if it.Kind == ItemTierHeader && it.Tier == currentItem.Tier {
+				m.RepoCursor = idx
+				break
+			}
+		}
+		return m, nil
+	case "right":
+		// If PRs not expanded and has PRs, expand them; if already expanded, step into first PR
+		if !m.isRepoPRExpanded(&repo) && currentItem.ChildCount > 0 {
+			m.toggleRepoPRExpanded(&repo)
+			return m, nil
+		} else if m.isRepoPRExpanded(&repo) && m.RepoCursor < len(items)-1 {
+			m.RepoCursor++
+			return m, nil
+		}
+		return m, nil
 	case "[":
-		// Collapse parent tier and land cursor on header
+		// If PRs expanded, collapse PRs; otherwise collapse parent tier
+		if m.isRepoPRExpanded(&repo) {
+			m.toggleRepoPRExpanded(&repo)
+			return m, nil
+		}
 		if m.CollapsedTiers == nil {
 			m.CollapsedTiers = make(map[storage.RepoTier]bool)
 		}
@@ -565,63 +934,16 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
-	case "p":
-		// 'p' pull requests: open Pull Requests tab filtered by the selected repository
-		m = m.recordRepoInteraction(repo.Name)
-		m.ActiveTab = TabPRs
-		m.PRFilter = repo.Name
-		m.PRCursor = 0
-		return m, func() tea.Msg {
-			return StatusToastMsg(fmt.Sprintf("Filtered pull requests for %s", repo.Name))
+	case "]":
+		// If PRs collapsed and has PRs, expand them
+		if !m.isRepoPRExpanded(&repo) && currentItem.ChildCount > 0 {
+			m.toggleRepoPRExpanded(&repo)
+			return m, nil
 		}
-	case "s":
-		// 's' session capability: switch to repository tmux session in Grubby window
-		m = m.recordRepoInteraction(repo.Name)
-		m = m.focusRepoCursor(repo.Name)
-		st := m.GitStatuses[repo.Name]
-		if st.IsCloned {
-			msg, err := GoToRepoSession(repo.Name, st.LocalPath)
-			if err != nil {
-				return m, func() tea.Msg { return StatusToastMsg("Failed to switch session: " + err.Error()) }
-			}
-			return m, tea.Batch(
-				func() tea.Msg { return StatusToastMsg(msg) },
-				m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
-			)
-		}
-		return m.startCloneWithAction(repo, RepoActionSession)
-	case "e":
-		// 'e' editor: open editor in a new window in the tmux session for that repo
-		m = m.recordRepoInteraction(repo.Name)
-		m = m.focusRepoCursor(repo.Name)
-		st := m.GitStatuses[repo.Name]
-		if st.IsCloned {
-			msg, err := OpenRepoEditor(repo.Name, st.LocalPath)
-			if err != nil {
-				return m, func() tea.Msg { return StatusToastMsg("Failed to open editor: " + err.Error()) }
-			}
-			return m, tea.Batch(
-				func() tea.Msg { return StatusToastMsg(msg) },
-				m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
-			)
-		}
-		return m.startCloneWithAction(repo, RepoActionEditor)
-	case "t":
-		// 't' open repo shell (creates new window if session exists, or creates session)
-		m = m.recordRepoInteraction(repo.Name)
-		m = m.focusRepoCursor(repo.Name)
-		st := m.GitStatuses[repo.Name]
-		if st.IsCloned {
-			msg, err := OpenRepoShell(repo.Name, st.LocalPath)
-			if err != nil {
-				return m, func() tea.Msg { return StatusToastMsg("Failed to open shell: " + err.Error()) }
-			}
-			return m, tea.Batch(
-				func() tea.Msg { return StatusToastMsg(msg) },
-				m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
-			)
-		}
-		return m.startCloneWithAction(repo, RepoActionShell)
+		return m, nil
+	case "C", "O":
+		// [C]laim replaces [O]
+		return m.toggleRepoOwnership(repo.Name)
 	case "c":
 		// 'c' clone repo
 		m = m.recordRepoInteraction(repo.Name)
@@ -631,57 +953,6 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, func() tea.Msg { return StatusToastMsg(repo.Name + " is already cloned!") }
 		}
 		return m.startCloneWithAction(repo, RepoActionNone)
-	case "enter":
-		// Enter key opens repository root in dedicated browser
-		m = m.recordRepoInteraction(repo.Name)
-		m = m.focusRepoCursor(repo.Name)
-		_ = OpenBrowser(repo.URL)
-		return m, tea.Batch(
-			func() tea.Msg { return StatusToastMsg("Opened " + repo.Name + " in dedicated browser") },
-			m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
-		)
-	case "o":
-		// 'o' opens the repo tabs submenu
-		m = m.recordRepoInteraction(repo.Name)
-		m = m.focusRepoCursor(repo.Name)
-		m.ActiveModal = ModalRepoTabs
-		m.ModalCursor = 0
-		m.RepoTabsYankLeader = false
-		return m, m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name)
-	case "O":
-		// 'O' (Shift-O) assigns or unassigns ownership of the selected repo to the current active squad
-		if m.Config == nil || m.Config.ActiveSquad == "" {
-			return m, func() tea.Msg { return StatusToastMsg("No active squad configured") }
-		}
-		activeSquad := m.Config.ActiveSquad
-		nowOwned, err := m.Config.ToggleRepoOwnership(activeSquad, repo.Name)
-		if err != nil {
-			return m, func() tea.Msg { return StatusToastMsg("Error: " + err.Error()) }
-		}
-		if m.DB != nil {
-			var squadDefs []github.SquadDefinition
-			for _, s := range m.Config.Squads {
-				squadDefs = append(squadDefs, github.SquadDefinition{
-					Name:        s.Name,
-					DisplayName: s.DisplayName,
-					Members:     s.Members,
-					Repos:       s.Repos,
-				})
-			}
-			_ = m.DB.SaveSquads(squadDefs)
-		}
-		dispName := activeSquad
-		if s := m.Config.GetActiveSquad(); s != nil && s.DisplayName != "" {
-			dispName = s.DisplayName
-		}
-		toastText := fmt.Sprintf("✓ Assigned '%s' to squad '%s'", repo.Name, dispName)
-		if !nowOwned {
-			toastText = fmt.Sprintf("Removed '%s' from squad '%s'", repo.Name, dispName)
-		}
-		return m, tea.Batch(
-			func() tea.Msg { return StatusToastMsg(toastText) },
-			m.syncSquadsFileCmd(),
-		)
 	case "l", "g":
 		// Open Labels modal for current repo
 		m.ActiveModal = ModalManageGroups
@@ -691,29 +962,28 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.SelectedRepoGroups[lbl] = true
 		}
 		return m, nil
-	case "u":
-		// Fast-forward repo
-		m = m.recordRepoInteraction(repo.Name)
-		m = m.focusRepoCursor(repo.Name)
-		st := m.GitStatuses[repo.Name]
-		if !st.IsCloned {
-			return m, func() tea.Msg { return StatusToastMsg("Repo is not cloned yet.") }
+	case "E":
+		// Expand all tiers
+		if m.CollapsedTiers == nil {
+			m.CollapsedTiers = make(map[storage.RepoTier]bool)
 		}
-		if st.IsDirty {
-			return m, func() tea.Msg { return StatusToastMsg("Cannot fast-forward: working tree has uncommitted changes!") }
+		for _, t := range []storage.RepoTier{storage.TierHot, storage.TierWarm, storage.TierCold, storage.TierDead, storage.TierHidden} {
+			m.CollapsedTiers[t] = false
 		}
-		if st.Behind == 0 {
-			return m, func() tea.Msg { return StatusToastMsg("Repo is already up to date.") }
+		return m, func() tea.Msg { return StatusToastMsg("Expanded all repository tiers") }
+	case "Z":
+		// Collapse all tiers
+		if m.CollapsedTiers == nil {
+			m.CollapsedTiers = make(map[storage.RepoTier]bool)
 		}
-		return m, func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			err := git.FastForward(ctx, st.LocalPath)
-			if err != nil {
-				return StatusToastMsg("Fast-forward error: " + err.Error())
-			}
-			return StatusToastMsg("Successfully fast-forwarded " + repo.Name)
+		for _, t := range []storage.RepoTier{storage.TierHot, storage.TierWarm, storage.TierCold, storage.TierDead, storage.TierHidden} {
+			m.CollapsedTiers[t] = true
 		}
+		newItems := m.getRepoTableItems()
+		if m.RepoCursor >= len(newItems) {
+			m.RepoCursor = len(newItems) - 1
+		}
+		return m, func() tea.Msg { return StatusToastMsg("Collapsed all repository tiers") }
 	}
 	return m, nil
 }
@@ -828,8 +1098,28 @@ func (m Model) renderReposView() string {
 			MetaBarStyle.Render(fmt.Sprintf("  (%d of %d repos) • %s%s • [Esc] Clear", len(repos), len(m.Repos), tierSummary, spinnerSuffix))
 		rows = append(rows, filterSummary)
 	} else if len(m.Repos) > 0 {
-		tierBar := MetaBarStyle.Render(fmt.Sprintf("  %s%s  (periodic polling focuses on Hot & Warm repos)", tierSummary, spinnerSuffix))
+		statusSuffix := "  (periodic polling focuses on Hot & Warm repos)"
+		if m.EventSub != nil {
+			statusSuffix = "  ⚡ Realtime Webhooks Active"
+		}
+		tierBar := MetaBarStyle.Render(fmt.Sprintf("  %s%s%s", tierSummary, spinnerSuffix, statusSuffix))
 		rows = append(rows, tierBar)
+	}
+
+	var leaderPrompt string
+	switch m.RepoLeaderMode {
+	case RepoLeaderFilter:
+		leaderPrompt = lipgloss.NewStyle().Background(lipgloss.Color("#2E3440")).Foreground(HighlightColor).Bold(true).
+			Render("  🔍 FILTER: [n] Name  [l] Label  [s] Squad (toggle)  [Esc] Cancel")
+	case RepoLeaderOpen:
+		leaderPrompt = lipgloss.NewStyle().Background(lipgloss.Color("#2E3440")).Foreground(PrimaryColor).Bold(true).
+			Render("  🌐 OPEN: [w/c] Web  [e] Editor  [s] Session  [p] PRs  [i] Issues  [a] Actions  [d] Security  [r] Releases  [n] Pulse  [Esc] Cancel")
+	case RepoLeaderYank:
+		leaderPrompt = lipgloss.NewStyle().Background(lipgloss.Color("#2E3440")).Foreground(WarningColor).Bold(true).
+			Render("  📋 YANK: [w/c] Web URL  [s] Session  [p] PRs URL  [i] Issues URL  [a] Actions URL  [d] Security URL  [r] Releases URL  [n] Pulse URL  [Esc] Cancel")
+	}
+	if leaderPrompt != "" {
+		rows = append(rows, leaderPrompt)
 	}
 
 	rows = append(rows, renderedHeader)
@@ -925,6 +1215,135 @@ func (m Model) renderReposView() string {
 			continue
 		}
 
+		if item.Kind == ItemRepoPR {
+			pr := *item.PR
+
+			// Check if this is the last PR for the parent repo
+			isLastPR := true
+			if i+1 < len(items) && items[i+1].Kind == ItemRepoPR {
+				isLastPR = false
+			}
+			treeSymbol := "├── "
+			if isLastPR {
+				treeSymbol = "└── "
+			}
+
+			prNumStr := fmt.Sprintf("#%-4d ", pr.Number)
+			styledNum := lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(prNumStr)
+			cleanTitle := strings.ReplaceAll(strings.ReplaceAll(pr.Title, "\r", " "), "\n", " ")
+
+			nameAvail := cols.NameWidth - len(treeSymbol) - len(prNumStr) - 6
+			if nameAvail > 3 && len(cleanTitle) > nameAvail {
+				cleanTitle = cleanTitle[:nameAvail-1] + "…"
+			} else if nameAvail <= 3 {
+				cleanTitle = ""
+			}
+			nameColText := "    " + lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(treeSymbol) + styledNum + cleanTitle
+
+			// Summary column: Review Decision + Comments
+			var reviewBadge string
+			switch pr.ReviewDecision {
+			case "APPROVED":
+				reviewBadge = ApprovedBadge.Render("APPROVED")
+			case "CHANGES_REQUESTED":
+				reviewBadge = ChangesReqBadge.Render("CHANGES_REQ")
+			case "REVIEW_REQUIRED":
+				reviewBadge = ReviewReqBadge.Render("REVIEW_REQ")
+			default:
+				reviewBadge = lipgloss.NewStyle().Foreground(MutedColor).Render("PENDING")
+			}
+			commentsBadge := fmt.Sprintf("💬 %d/%d", pr.UnresolvedComments, pr.TotalComments)
+			if pr.UnresolvedComments > 0 {
+				commentsBadge = lipgloss.NewStyle().Foreground(WarningColor).Render(commentsBadge)
+			} else {
+				commentsBadge = lipgloss.NewStyle().Foreground(MutedColor).Render(commentsBadge)
+			}
+			summaryColText := fmt.Sprintf("%s %s", reviewBadge, commentsBadge)
+
+			// Git column: Author & Draft indicator
+			authorText := "@" + pr.Author
+			if pr.IsDraft {
+				authorText += " (draft)"
+			}
+			if len(authorText) > cols.GitWidth-2 && cols.GitWidth > 3 {
+				authorText = authorText[:cols.GitWidth-3] + "…"
+			}
+			gitColText := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(authorText)
+
+			// Session column: Branch
+			branchText := "-"
+			if pr.HeadRefName != "" {
+				branchText = "⑂ " + pr.HeadRefName
+				if len(branchText) > cols.SessionWidth-2 && cols.SessionWidth > 3 {
+					branchText = branchText[:cols.SessionWidth-3] + "…"
+				}
+			}
+			sessionColText := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(branchText)
+
+			// Last column: Age
+			var rawAge string
+			if pr.CreatedAt.IsZero() {
+				rawAge = "-"
+			} else if pr.DaysStale() >= 3 {
+				rawAge = fmt.Sprintf("%dd [!]", pr.DaysStale())
+			} else {
+				rawAge = formatTimeAgo(pr.CreatedAt)
+			}
+			var lastColText string
+			if pr.DaysStale() >= 3 && !pr.CreatedAt.IsZero() {
+				lastColText = StaleBadge.Render(rawAge)
+			} else {
+				lastColText = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(rawAge)
+			}
+
+			// Path column: Labels or URL
+			pathText := "-"
+			if len(pr.Labels) > 0 {
+				pathText = strings.Join(pr.Labels, ", ")
+			} else if pr.URL != "" {
+				pathText = pr.URL
+			}
+			if len(pathText) > cols.PathWidth-2 && cols.PathWidth > 3 {
+				pathText = pathText[:cols.PathWidth-3] + "…"
+			}
+			pathColText := lipgloss.NewStyle().Foreground(lipgloss.Color("#555566")).Render(pathText)
+
+			isFlashing, flashBg := m.isEntityFlashing(fmt.Sprintf("pr:%s#%d", pr.DisplayRepo(), pr.Number))
+			if !isFlashing {
+				isFlashing, flashBg = m.isEntityFlashing(fmt.Sprintf("pr:%s#%d", pr.Repo, pr.Number))
+			}
+
+			cursorPrefix := "  "
+			if isFlashing {
+				cursorPrefix = "⚡ "
+			} else if i == m.RepoCursor {
+				cursorPrefix = "▶ "
+			}
+
+			rowCells := lipgloss.JoinHorizontal(lipgloss.Top,
+				cols.Cursor.Render(cursorPrefix),
+				cols.Name.Render(nameColText),
+				cols.Summary.Render(summaryColText),
+				cols.Git.Render(gitColText),
+				cols.Session.Render(sessionColText),
+				cols.Last.Render(lastColText),
+				cols.Path.Render(pathColText),
+			)
+
+			if i == m.RepoCursor {
+				if isFlashing {
+					rows = append(rows, SelectedRowStyle.Background(flashBg).MaxHeight(1).Render(rowCells))
+				} else {
+					rows = append(rows, SelectedRowStyle.MaxHeight(1).Render(rowCells))
+				}
+			} else if isFlashing {
+				rows = append(rows, lipgloss.NewStyle().Background(flashBg).MaxHeight(1).Render(rowCells))
+			} else {
+				rows = append(rows, NormalRowStyle.MaxHeight(1).Render(rowCells))
+			}
+			continue
+		}
+
 		// Repo row
 		r := *item.Repo
 		st := m.GitStatuses[r.Name]
@@ -936,6 +1355,11 @@ func (m Model) renderReposView() string {
 
 		// Name & Labels formatting
 		repoDisplayName := r.Name
+		if r.Owner != "" {
+			repoDisplayName = r.Owner + "/" + r.Name
+		} else if r.FullName != "" {
+			repoDisplayName = r.FullName
+		}
 		labels := m.getRepoLabels(&r)
 
 		var styledLabels []string
@@ -948,27 +1372,47 @@ func (m Model) renderReposView() string {
 			}
 		}
 
-		// Squad ownership indicator
+		// Squad ownership & Home Org indicators
 		isOwned := false
 		if m.Config != nil && m.Config.ActiveSquad != "" {
 			isOwned = m.Config.IsRepoOwnedBySquad(m.Config.ActiveSquad, r.Name)
 		}
 
 		var styledName string
-		squadPrefix := ""
+		prefix := ""
 		if isOwned {
-			squadPrefix = "👥 "
+			prefix += "👥 "
+		}
+		if r.IsHomeOrg {
+			prefix += "🏠 "
 		}
 		if isDead {
-			styledName = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(squadPrefix + repoDisplayName)
+			styledName = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(prefix + repoDisplayName)
 		} else if isOwned {
-			styledName = lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render(squadPrefix + repoDisplayName)
+			styledName = lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render(prefix + repoDisplayName)
 		} else {
-			styledName = lipgloss.NewStyle().Bold(true).Render(repoDisplayName)
+			styledName = lipgloss.NewStyle().Bold(true).Render(prefix + repoDisplayName)
+		}
+
+		rawNameLen := 2 + lipgloss.Width(prefix) + len(repoDisplayName)
+
+		// Expansion badge for PRs if any open PRs
+		if item.ChildCount > 0 {
+			prUnit := "PRs"
+			if item.ChildCount == 1 {
+				prUnit = "PR"
+			}
+			var expBadge string
+			if item.Expanded {
+				expBadge = lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render(fmt.Sprintf(" [▼ %d %s]", item.ChildCount, prUnit))
+			} else {
+				expBadge = lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(fmt.Sprintf(" [▶ %d %s]", item.ChildCount, prUnit))
+			}
+			styledName += expBadge
+			rawNameLen += 5 + len(fmt.Sprintf("%d", item.ChildCount)) + len(prUnit)
 		}
 
 		nameColText := "  " + styledName
-		rawNameLen := 2 + len(squadPrefix) + len(repoDisplayName)
 		if len(styledLabels) > 0 {
 			nameColText += " " + strings.Join(styledLabels, " ")
 			for _, lbl := range labels {
@@ -1109,13 +1553,20 @@ func (m Model) renderReposView() string {
 			localPath = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(localPath)
 		}
 
-		prefix := "  "
-		if i == m.RepoCursor {
-			prefix = "▶ "
+		isFlashing, flashBg := m.isEntityFlashing("repo:" + r.FullName)
+		if !isFlashing {
+			isFlashing, flashBg = m.isEntityFlashing("repo:" + r.Name)
+		}
+
+		cursorPrefix := "  "
+		if isFlashing {
+			cursorPrefix = "⚡ "
+		} else if i == m.RepoCursor {
+			cursorPrefix = "▶ "
 		}
 
 		rowCells := lipgloss.JoinHorizontal(lipgloss.Top,
-			cols.Cursor.Render(prefix),
+			cols.Cursor.Render(cursorPrefix),
 			cols.Name.Render(nameColText),
 			cols.Summary.Render(summaryColText),
 			cols.Git.Render(styledBadge),
@@ -1125,7 +1576,13 @@ func (m Model) renderReposView() string {
 		)
 
 		if i == m.RepoCursor {
-			rows = append(rows, SelectedRowStyle.MaxHeight(1).Render(rowCells))
+			if isFlashing {
+				rows = append(rows, SelectedRowStyle.Background(flashBg).MaxHeight(1).Render(rowCells))
+			} else {
+				rows = append(rows, SelectedRowStyle.MaxHeight(1).Render(rowCells))
+			}
+		} else if isFlashing {
+			rows = append(rows, lipgloss.NewStyle().Background(flashBg).MaxHeight(1).Render(rowCells))
 		} else {
 			rows = append(rows, NormalRowStyle.MaxHeight(1).Render(rowCells))
 		}

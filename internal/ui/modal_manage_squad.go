@@ -17,6 +17,8 @@ const (
 	SquadModeRemove
 	SquadModeRename
 	SquadModeDeleteConfirm
+	SquadModeAddOrg
+	SquadModeRemoveOrg
 )
 
 func (m Model) getManagedSquad() (string, []string, bool) {
@@ -188,6 +190,57 @@ func (m Model) renderManageSquadModal() string {
 		lines = append(lines, MetaBarStyle.Render("[Enter] Save New Name  [Esc] Cancel"))
 		return ModalBoxStyle.Render(strings.Join(lines, "\n"))
 
+	case SquadModeAddOrg:
+		title := ModalTitleStyle.Render(fmt.Sprintf("Add Organization to Squad: %s", squadName))
+		var lines []string
+		lines = append(lines, title)
+		lines = append(lines, "Enter GitHub organization or user account to operate on:\n")
+		lines = append(lines, "Organization: "+m.ModalInput.View()+"\n")
+		lines = append(lines, MetaBarStyle.Render("[Enter] Add Organization  [Esc] Cancel"))
+		return ModalBoxStyle.Render(strings.Join(lines, "\n"))
+
+	case SquadModeRemoveOrg:
+		title := ModalTitleStyle.Render(fmt.Sprintf("Remove Organization from Squad: %s", squadName))
+		var lines []string
+		lines = append(lines, title)
+		lines = append(lines, "Mark organizations to remove with [Space], then press [Enter] to delete. [Esc] Back.\n")
+
+		squadOrgs := m.Config.GetOrgsForSquad(squadName)
+		if len(squadOrgs) == 0 {
+			lines = append(lines, "  No organizations currently configured for this squad.")
+		} else {
+			if m.ModalCursor >= len(squadOrgs) {
+				m.ModalCursor = len(squadOrgs) - 1
+			}
+			if m.ModalCursor < 0 {
+				m.ModalCursor = 0
+			}
+
+			for i, org := range squadOrgs {
+				cursor := "  "
+				if i == m.ModalCursor {
+					cursor = "▶ "
+				}
+				orgLower := strings.ToLower(org)
+				check := "[ ]"
+				suffix := ""
+				if m.SelectedSquadMembers[orgLower] {
+					check = "[x]"
+					suffix = lipgloss.NewStyle().Foreground(DangerColor).Bold(true).Render(" (will remove)")
+				}
+				line := fmt.Sprintf("%s%s %s%s", cursor, check, org, suffix)
+				if i == m.ModalCursor {
+					lines = append(lines, SelectedRowStyle.Render(line))
+				} else {
+					lines = append(lines, NormalRowStyle.Render(line))
+				}
+			}
+		}
+
+		toRemoveCount := len(m.SelectedSquadMembers)
+		lines = append(lines, "\n"+MetaBarStyle.Render(fmt.Sprintf("Marked to remove: %d | [Space] Toggle [Enter] Confirm Deletion [Esc] Back", toRemoveCount)))
+		return ModalBoxStyle.Render(strings.Join(lines, "\n"))
+
 	case SquadModeDeleteConfirm:
 		title := lipgloss.NewStyle().Bold(true).Foreground(DangerColor).Render("Delete Squad Confirmation")
 		var lines []string
@@ -213,12 +266,26 @@ func (m Model) renderManageSquadModal() string {
 			}
 			lines = append(lines, "  Members: "+strings.Join(memberTags, ", "))
 		}
+
+		// Display current organizations
+		squadOrgs := m.Config.GetOrgsForSquad(squadName)
+		if len(squadOrgs) == 0 {
+			lines = append(lines, "  Organizations: "+lipgloss.NewStyle().Foreground(MutedColor).Render("(None configured. Press [o] to add organization)"))
+		} else {
+			orgBadges := make([]string, len(squadOrgs))
+			for i, o := range squadOrgs {
+				orgBadges[i] = lipgloss.NewStyle().Foreground(HighlightColor).Render(o)
+			}
+			lines = append(lines, "  Organizations: "+strings.Join(orgBadges, ", "))
+		}
 		lines = append(lines, "")
 
 		// Action Menu
 		actions := []string{
 			"  [a] Add Members from Organization",
 			"  [d] Delete / Remove Members",
+			"  [o] Add Organization to Squad",
+			"  [O] Remove Organization from Squad",
 			"  [r] Rename Squad",
 			"  [x] Delete Entire Squad",
 		}
@@ -402,6 +469,80 @@ func (m Model) handleManageSquadModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+	case SquadModeAddOrg:
+		switch msg.String() {
+		case "esc":
+			m.SquadManageMode = SquadModeOverview
+			m.ModalInput.Reset()
+			m.ModalInput.Blur()
+			return m, nil
+		case "enter":
+			orgName := strings.TrimSpace(m.ModalInput.Value())
+			if orgName != "" {
+				_ = m.Config.AddOrgToSquad(squadName, orgName)
+				m.SquadManageMode = SquadModeOverview
+				m.ModalInput.Reset()
+				m.ModalInput.Blur()
+				return m, tea.Batch(
+					func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Added org '%s' to squad '%s'", orgName, squadName)) },
+					m.loadDataCmd(),
+					m.syncSquadsFileCmd(),
+				)
+			}
+			m.SquadManageMode = SquadModeOverview
+			m.ModalInput.Reset()
+			m.ModalInput.Blur()
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.ModalInput, cmd = m.ModalInput.Update(msg)
+			return m, cmd
+		}
+
+	case SquadModeRemoveOrg:
+		squadOrgs := m.Config.GetOrgsForSquad(squadName)
+		switch msg.String() {
+		case "esc":
+			m.SquadManageMode = SquadModeOverview
+			m.SelectedSquadMembers = make(map[string]bool)
+			return m, nil
+		case "up", "k":
+			if m.ModalCursor > 0 {
+				m.ModalCursor--
+			}
+			return m, nil
+		case "down", "j":
+			if m.ModalCursor < len(squadOrgs)-1 {
+				m.ModalCursor++
+			}
+			return m, nil
+		case " ":
+			if len(squadOrgs) > 0 && m.ModalCursor < len(squadOrgs) {
+				orgLower := strings.ToLower(squadOrgs[m.ModalCursor])
+				if m.SelectedSquadMembers[orgLower] {
+					delete(m.SelectedSquadMembers, orgLower)
+				} else {
+					m.SelectedSquadMembers[orgLower] = true
+				}
+			}
+			return m, nil
+		case "enter":
+			removedCount := 0
+			for _, o := range squadOrgs {
+				if m.SelectedSquadMembers[strings.ToLower(o)] {
+					_ = m.Config.RemoveOrgFromSquad(squadName, o)
+					removedCount++
+				}
+			}
+			m.SquadManageMode = SquadModeOverview
+			m.SelectedSquadMembers = make(map[string]bool)
+			return m, tea.Batch(
+				func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Removed %d organization(s) from squad", removedCount)) },
+				m.loadDataCmd(),
+				m.syncSquadsFileCmd(),
+			)
+		}
+
 	default: // SquadModeOverview
 		switch msg.String() {
 		case "esc", "q":
@@ -418,6 +559,18 @@ func (m Model) handleManageSquadModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		case "d":
 			m.SquadManageMode = SquadModeRemove
+			m.ModalCursor = 0
+			m.SelectedSquadMembers = make(map[string]bool)
+			return m, nil
+		case "o":
+			m.SquadManageMode = SquadModeAddOrg
+			m.ModalCursor = 0
+			m.ModalInput.Reset()
+			m.ModalInput.Placeholder = "Organization name (e.g. bronners-org)..."
+			m.ModalInput.Focus()
+			return m, textinput.Blink
+		case "O":
+			m.SquadManageMode = SquadModeRemoveOrg
 			m.ModalCursor = 0
 			m.SelectedSquadMembers = make(map[string]bool)
 			return m, nil

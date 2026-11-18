@@ -107,6 +107,7 @@ type Task struct {
 	Priority    TaskPriority `json:"priority"`
 	RepoOwner   string       `json:"repo_owner"`
 	RepoName    string       `json:"repo_name"`
+	IsHomeRepo  bool         `json:"is_home_repo,omitempty"`
 	Author      string       `json:"author"`
 	Assignees   []string     `json:"assignees"`
 	Labels      []string     `json:"labels"`

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -242,25 +243,28 @@ func TestReposKeyHandling_FilterAndSortKeys(t *testing.T) {
 	// Test uncloned repo auto-clone triggers
 	// docs is not cloned in createTestModel()
 	m.RepoCursor = 3 // docs
-	updated, cmd := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	var cmd tea.Cmd
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	updated, cmd = updated.(Model).handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 	m = updated.(Model)
 	if cmd == nil {
-		t.Errorf("expected non-nil clone command when pressing 's' on uncloned repo")
+		t.Errorf("expected non-nil clone command when pressing 'o' then 's' on uncloned repo")
 	}
 	if !strings.Contains(m.StatusMsg, "Cloning") {
 		t.Errorf("expected status msg to indicate cloning, got %q", m.StatusMsg)
 	}
 
-	updated, cmd = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	updated, cmd = updated.(Model).handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
 	m = updated.(Model)
 	if cmd == nil {
-		t.Errorf("expected non-nil clone command when pressing 'e' on uncloned repo")
+		t.Errorf("expected non-nil clone command when pressing 'o' then 'e' on uncloned repo")
 	}
 
-	updated, cmd = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	updated, cmd = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
 	m = updated.(Model)
 	if cmd == nil {
-		t.Errorf("expected non-nil clone command when pressing 't' on uncloned repo")
+		t.Errorf("expected non-nil clone command when pressing 'c' on uncloned repo")
 	}
 }
 
@@ -370,14 +374,15 @@ func TestReposKeyHandling_RecordInteractionMovesToTop(t *testing.T) {
 		t.Fatalf("expected repo-a at pos 0 initially, got %s", display[0].Name)
 	}
 
-	// Cursor is on repo-b, user presses Enter to open web
+	// Cursor is on repo-b, user presses 'o' then 'w' to open web
 	for idx, it := range m.getRepoTableItems() {
 		if it.Kind == ItemRepo && it.Repo != nil && it.Repo.Name == "repo-b" {
 			m.RepoCursor = idx
 			break
 		}
 	}
-	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	updated, _ = updated.(Model).handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
 	m = updated.(Model)
 
 	// repo-b was interacted with just now, so it should move to pos 0 in getDisplayRepos()
@@ -465,16 +470,29 @@ func TestRepoTiersRenderingAndSorting(t *testing.T) {
 	}
 }
 
-func TestRepoOpenPRsFilteredWithPKey(t *testing.T) {
+func TestRepoOpenPRs_InlineExpansion(t *testing.T) {
 	repos := []github.Repository{
 		{Name: "my-service", FullName: "my-org/my-service"},
 		{Name: "other-repo", FullName: "my-org/other-repo"},
 	}
+	prs := []github.PullRequest{
+		{
+			Number:         42,
+			Repo:           "my-service",
+			RepoFullName:   "my-org/my-service",
+			Title:          "Fix database deadlock",
+			Author:         "alice",
+			URL:            "https://github.com/my-org/my-service/pull/42",
+			ReviewDecision: "APPROVED",
+		},
+	}
 	m := Model{
-		ActiveTab:  TabRepos,
-		Repos:      repos,
-		Width:      140,
-		Height:     30,
+		ActiveTab:       TabRepos,
+		Repos:           repos,
+		PRs:             prs,
+		Width:           140,
+		Height:          30,
+		ExpandedRepoPRs: make(map[string]bool),
 	}
 	for idx, it := range m.getRepoTableItems() {
 		if it.Kind == ItemRepo && it.Repo != nil && it.Repo.Name == "my-service" {
@@ -483,20 +501,47 @@ func TestRepoOpenPRsFilteredWithPKey(t *testing.T) {
 		}
 	}
 
-	updated, cmd := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	// Press Enter on my-service -> toggles PR expansion
+	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyEnter})
 	upModel := updated.(Model)
 
-	if upModel.ActiveTab != TabPRs {
-		t.Errorf("expected ActiveTab to be TabPRs (%d), got %d", TabPRs, upModel.ActiveTab)
+	if !upModel.isRepoPRExpanded(&repos[0]) {
+		t.Fatalf("expected my-service PRs to be expanded")
 	}
-	if upModel.PRFilter != "my-service" {
-		t.Errorf("expected PRFilter to be 'my-service', got %q", upModel.PRFilter)
+
+	items := upModel.getRepoTableItems()
+	foundPR := false
+	var prIdx int
+	for idx, it := range items {
+		if it.Kind == ItemRepoPR && it.PR != nil && it.PR.Number == 42 {
+			foundPR = true
+			prIdx = idx
+			break
+		}
 	}
-	if upModel.PRCursor != 0 {
-		t.Errorf("expected PRCursor to be 0, got %d", upModel.PRCursor)
+	if !foundPR {
+		t.Fatalf("expected ItemRepoPR child item in table items")
 	}
-	if cmd == nil {
-		t.Errorf("expected status toast cmd, got nil")
+
+	// Move cursor to PR item
+	upModel.RepoCursor = prIdx
+	updatedPR, cmdPR := upModel.handleReposKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmdPR == nil {
+		t.Fatalf("expected toast message when opening PR in browser")
+	}
+	toastMsg := string(cmdPR().(StatusToastMsg))
+	if !strings.Contains(toastMsg, "PR #42") {
+		t.Errorf("expected toast to mention PR #42, got %q", toastMsg)
+	}
+
+	// Press 'y' on PR item -> yanks PR URL
+	_, cmdYank := updatedPR.(Model).handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmdYank == nil {
+		t.Fatalf("expected toast message when yanking PR URL")
+	}
+	yankMsg := string(cmdYank().(StatusToastMsg))
+	if !strings.Contains(yankMsg, "Copied PR #42 URL") {
+		t.Errorf("expected toast to mention copied URL, got %q", yankMsg)
 	}
 }
 
@@ -530,14 +575,15 @@ func TestRepoInteractionTouchesSQLite(t *testing.T) {
 		t.Fatalf("expected initial tier cold, got %v", tier)
 	}
 
-	// User interacts with repo (Enter key on my-cold-repo)
+	// User interacts with repo (open via 'o' then 'w' on my-cold-repo)
 	for idx, it := range m.getRepoTableItems() {
 		if it.Kind == ItemRepo && it.Repo != nil && it.Repo.Name == "my-cold-repo" {
 			m.RepoCursor = idx
 			break
 		}
 	}
-	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	updated, _ = updated.(Model).handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
 	m = updated.(Model)
 
 	// Interaction must NOT change tier (it stays TierCold!)
@@ -756,7 +802,7 @@ func TestSummaryColumnAndInlineLabelsRendering(t *testing.T) {
 	}
 
 	// 3. Verify repository About / description text is rendered (chopped with … if needed)
-	if !strings.Contains(view, "Authentication and au") {
+	if !strings.Contains(view, "Authenticati") {
 		t.Errorf("expected repository About text in repo view, got:\n%s", view)
 	}
 
@@ -984,10 +1030,10 @@ func TestReposView_SquadOwnershipToggle_ShiftO(t *testing.T) {
 		t.Fatalf("expected auth-service to be owned by backend-squad after Shift-O")
 	}
 
-	// Check that view contains ownership icon 👥
+	// Check that view contains ownership icon 👥 and the repo name
 	view := m.renderReposView()
-	if !strings.Contains(view, "👥 auth-service") {
-		t.Fatalf("expected view to contain '👥 auth-service', got:\n%s", view)
+	if !strings.Contains(view, "👥") || !strings.Contains(view, "auth-service") {
+		t.Fatalf("expected view to contain '👥' and 'auth-service', got:\n%s", view)
 	}
 
 	// Press 'O' again to toggle off
@@ -1170,6 +1216,202 @@ func TestTierCollapsingDefaultsAndShortcuts(t *testing.T) {
 		t.Fatalf("expected 10 items when all expanded, got %d", len(allExpandedItems))
 	}
 }
+
+func TestMultiOrgRepoDeduplication(t *testing.T) {
+	// 1. Test InitialModel deduplication with SQLite DB containing duplicates
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("storage.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now()
+	_ = db.SaveRepositories([]github.Repository{
+		{
+			ID:        101,
+			Name:      "tessell",
+			FullName:  "bronners-org/tessell",
+			Owner:     "bronners-org",
+			PushedAt:  now,
+			UpdatedAt: now,
+		},
+	}, "bronners-org")
+
+	cfg := &config.Config{
+		ActiveSquad: "core",
+		Squads: []config.SquadConfig{
+			{
+				Name:          "core",
+				Organizations: []string{"simonbronner", "bronners-org"},
+			},
+		},
+	}
+
+	m := InitialModel(cfg, nil, nil, "bronners-org", db)
+	if len(m.Repos) != 1 {
+		t.Fatalf("expected 1 repo loaded from DB without duplicates, got %d", len(m.Repos))
+	}
+	if m.Repos[0].FullName != "bronners-org/tessell" {
+		t.Fatalf("expected bronners-org/tessell, got %s", m.Repos[0].FullName)
+	}
+
+	// 2. Test DataLoadedMsg updates m.Repos without duplicates
+	dupRepos := []github.Repository{
+		{
+			ID:       101,
+			Name:     "tessell",
+			FullName: "bronners-org/tessell",
+			Owner:    "bronners-org",
+		},
+		{
+			ID:       102,
+			Name:     "clj-stamp-duty",
+			FullName: "bronners-org/clj-stamp-duty",
+			Owner:    "bronners-org",
+		},
+	}
+
+	updated, _ := m.Update(DataLoadedMsg{
+		Repos: dupRepos,
+	})
+	m = updated.(Model)
+
+	if len(m.Repos) != 2 {
+		t.Fatalf("expected 2 unique repos, got %d", len(m.Repos))
+	}
+}
+
+func TestReposLeaderKeys_FilterOpenYankClaim(t *testing.T) {
+	m := createTestModel()
+	m.Config.ActiveSquad = "backend-squad"
+	m.Config.Squads = []config.SquadConfig{
+		{
+			Name:        "backend-squad",
+			DisplayName: "Backend Squad",
+			Members:     []string{"alice"},
+			Repos:       []string{},
+		},
+	}
+
+	// Focus first repo (auth-service)
+	for idx, it := range m.getRepoTableItems() {
+		if it.Kind == ItemRepo && it.Repo != nil && it.Repo.Name == "auth-service" {
+			m.RepoCursor = idx
+			break
+		}
+	}
+
+	// 1. Test [f]ilter leader -> [n]ame modal
+	updated, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	if m.RepoLeaderMode != RepoLeaderFilter {
+		t.Fatalf("expected RepoLeaderFilter, got %v", m.RepoLeaderMode)
+	}
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(Model)
+	if m.ActiveModal != ModalFilterRepoName {
+		t.Fatalf("expected ModalFilterRepoName, got %v", m.ActiveModal)
+	}
+	m.ActiveModal = ModalNone
+
+	// 2. Test [f]ilter leader -> [l]abel modal
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.ActiveModal != ModalFilterGroup {
+		t.Fatalf("expected ModalFilterGroup, got %v", m.ActiveModal)
+	}
+	m.ActiveModal = ModalNone
+
+	// 3. Test [f]ilter leader -> [s]quad toggle
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	updated, cmdS := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if !m.SquadFilterActive {
+		t.Fatalf("expected SquadFilterActive=true")
+	}
+	if cmdS == nil {
+		t.Fatalf("expected toast message for squad filter toggle")
+	}
+
+	// Toggle back off
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if m.SquadFilterActive {
+		t.Fatalf("expected SquadFilterActive=false")
+	}
+
+	// 4. Test [C]laim replaces [O]
+	for idx, it := range m.getRepoTableItems() {
+		if it.Kind == ItemRepo && it.Repo != nil && it.Repo.Name == "auth-service" {
+			m.RepoCursor = idx
+			break
+		}
+	}
+	if m.Config.IsRepoOwnedBySquad("backend-squad", "auth-service") {
+		t.Fatalf("expected auth-service not to be owned initially")
+	}
+	updated, cmdC := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'C'}})
+	m = updated.(Model)
+	if !m.Config.IsRepoOwnedBySquad("backend-squad", "auth-service") {
+		t.Fatalf("expected auth-service to be owned after [C]laim")
+	}
+	if cmdC == nil {
+		t.Fatalf("expected toast message cmd after claim")
+	}
+
+	// 5. Test [o]pen leader -> [p] (PRs in browser)
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	m = updated.(Model)
+	if m.RepoLeaderMode != RepoLeaderOpen {
+		t.Fatalf("expected RepoLeaderOpen, got %v", m.RepoLeaderMode)
+	}
+	updated, cmdOpenP := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(Model)
+	if cmdOpenP == nil {
+		t.Fatalf("expected toast cmd after open PRs")
+	}
+	toast := string(cmdOpenP().(StatusToastMsg))
+	if !strings.Contains(toast, "Pull Requests in browser") {
+		t.Errorf("expected toast to mention Pull Requests, got %q", toast)
+	}
+
+	// 6. Test [y]ank leader -> [p] (PRs URL yanked)
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+	if m.RepoLeaderMode != RepoLeaderYank {
+		t.Fatalf("expected RepoLeaderYank, got %v", m.RepoLeaderMode)
+	}
+	updated, cmdYankP := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(Model)
+	if cmdYankP == nil {
+		t.Fatalf("expected toast cmd after yank PRs URL")
+	}
+	yankToast := string(cmdYankP().(StatusToastMsg))
+	if !strings.Contains(yankToast, "PRs URL to clipboard") {
+		t.Errorf("expected toast to mention PRs URL to clipboard, got %q", yankToast)
+	}
+
+	// 7. Test [y]ank leader -> [s] (session name yanked)
+	updated, _ = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+	updated, cmdYankS := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if cmdYankS == nil {
+		t.Fatalf("expected toast cmd after yank session")
+	}
+	sessToast := string(cmdYankS().(StatusToastMsg))
+	if !strings.Contains(sessToast, "Copied session name") {
+		t.Errorf("expected toast to mention copied session name, got %q", sessToast)
+	}
+}
+
 
 
 

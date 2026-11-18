@@ -615,6 +615,122 @@ func (m Model) renderSquadDashboardView() (string, []AvatarPlacement) {
 		}
 	}
 
+	// --- Table: Consolidated Squad Repositories Open PRs & Reviews ---
+	rightLines = append(rightLines, "")
+	prHeader := lipgloss.NewStyle().Bold(true).Foreground(SecondaryColor).Render("  ⑂ SQUAD REPOSITORIES OPEN PRS & REVIEWS")
+	rightLines = append(rightLines, prHeader)
+
+	type SquadRepoPRItem struct {
+		RepoName     string
+		Approved     int
+		ReviewReq    int
+		ChangesReq   int
+		WithComments int
+		TotalOpen    int
+		LatestUpdate time.Time
+	}
+
+	var squadPRItems []SquadRepoPRItem
+	for _, repoName := range ownedRepos {
+		cleanName := strings.TrimSpace(repoName)
+		if cleanName == "" {
+			continue
+		}
+		item := SquadRepoPRItem{RepoName: cleanName}
+		for _, pr := range m.PRs {
+			if strings.EqualFold(pr.Repo, cleanName) || strings.EqualFold(github.NormalizeRepoName(pr.Repo), github.NormalizeRepoName(cleanName)) ||
+				strings.EqualFold(pr.RepoFullName, cleanName) {
+				if strings.EqualFold(pr.State, "closed") || strings.EqualFold(pr.State, "merged") {
+					continue
+				}
+				item.TotalOpen++
+				switch pr.ReviewDecision {
+				case "APPROVED":
+					item.Approved++
+				case "CHANGES_REQUESTED":
+					item.ChangesReq++
+				case "REVIEW_REQUIRED":
+					item.ReviewReq++
+				}
+				if pr.UnresolvedComments > 0 || pr.TotalComments > 0 {
+					item.WithComments++
+				}
+				if pr.UpdatedAt.After(item.LatestUpdate) {
+					item.LatestUpdate = pr.UpdatedAt
+				}
+			}
+		}
+		if item.TotalOpen > 0 {
+			squadPRItems = append(squadPRItems, item)
+		}
+	}
+
+	// Order by most recently updated repository
+	sort.Slice(squadPRItems, func(i, j int) bool {
+		return squadPRItems[i].LatestUpdate.After(squadPRItems[j].LatestUpdate)
+	})
+
+	prRepoColW := 18
+	prStatColW := 7
+
+	prRepoStyle := lipgloss.NewStyle().Width(prRepoColW).MaxWidth(prRepoColW).MaxHeight(1).Inline(true)
+	prStatStyle := lipgloss.NewStyle().Width(prStatColW).MaxWidth(prStatColW).MaxHeight(1).Inline(true)
+
+	prTableHead := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		"  ",
+		TableHeaderStyle.Render(prRepoStyle.Render("REPOSITORY")),
+		TableHeaderStyle.Render(prStatStyle.Render("APPRV")),
+		TableHeaderStyle.Render(prStatStyle.Render("WAIT")),
+		TableHeaderStyle.Render(prStatStyle.Render("CHG/CMT")),
+		TableHeaderStyle.Render(prStatStyle.Render("TOTAL")),
+	)
+	rightLines = append(rightLines, prTableHead)
+
+	if len(squadPRItems) == 0 {
+		rightLines = append(rightLines, lipgloss.NewStyle().Foreground(SuccessColor).Bold(true).Render("    ✓ 0 open pull requests across squad repos"))
+	} else {
+		for _, item := range squadPRItems {
+			rName := item.RepoName
+			if len(rName) > prRepoColW-2 {
+				rName = rName[:prRepoColW-3] + "…"
+			}
+			apprvStr := "-"
+			if item.Approved > 0 {
+				apprvStr = lipgloss.NewStyle().Bold(true).Foreground(SuccessColor).Render(fmt.Sprintf("✓ %d", item.Approved))
+			} else {
+				apprvStr = lipgloss.NewStyle().Foreground(MutedColor).Render("-")
+			}
+			waitStr := "-"
+			if item.ReviewReq > 0 {
+				waitStr = lipgloss.NewStyle().Bold(true).Foreground(WarningColor).Render(fmt.Sprintf("⏳ %d", item.ReviewReq))
+			} else {
+				waitStr = lipgloss.NewStyle().Foreground(MutedColor).Render("-")
+			}
+			chgStr := "-"
+			if item.ChangesReq > 0 || item.WithComments > 0 {
+				totalChg := item.ChangesReq
+				if totalChg == 0 {
+					totalChg = item.WithComments
+				}
+				chgStr = lipgloss.NewStyle().Bold(true).Foreground(DangerColor).Render(fmt.Sprintf("💬 %d", totalChg))
+			} else {
+				chgStr = lipgloss.NewStyle().Foreground(MutedColor).Render("-")
+			}
+			totStr := lipgloss.NewStyle().Bold(true).Foreground(HighlightColor).Render(fmt.Sprintf("%d", item.TotalOpen))
+
+			prRow := lipgloss.JoinHorizontal(
+				lipgloss.Top,
+				prRepoStyle.Render(lipgloss.NewStyle().Bold(true).Foreground(HighlightColor).Render(rName)),
+				prStatStyle.Render(apprvStr),
+				prStatStyle.Render(waitStr),
+				prStatStyle.Render(chgStr),
+				prStatStyle.Render(totStr),
+			)
+			rightLines = append(rightLines, "  "+prRow)
+		}
+	}
+
 	leftBlock := strings.Join(leftLines, "\n")
 	rightBlock := strings.Join(rightLines, "\n")
 

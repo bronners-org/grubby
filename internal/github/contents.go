@@ -39,11 +39,12 @@ type GitHubFileCommitPayload struct {
 
 // SquadDefinition defines a single squad, its roster, and its owned repositories in squads.json.
 type SquadDefinition struct {
-	Name        string   `json:"name"`
-	DisplayName string   `json:"display_name"`
-	Description string   `json:"description,omitempty"`
-	Members     []string `json:"members"`
-	Repos       []string `json:"repos,omitempty"`
+	Name          string   `json:"name"`
+	DisplayName   string   `json:"display_name"`
+	Description   string   `json:"description,omitempty"`
+	Members       []string `json:"members"`
+	Organizations []string `json:"organizations,omitempty"`
+	Repos         []string `json:"repos,omitempty"`
 }
 
 // SquadsFile represents the schema of squads.json in the central repository.

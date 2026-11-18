@@ -23,10 +23,20 @@ func NormalizeRepoName(raw string) string {
 	return strings.TrimSpace(s)
 }
 
+type Organization struct {
+	Login        string    `json:"login"`
+	IsHome       bool      `json:"is_home"`
+	Name         string    `json:"name"`
+	AvatarURL    string    `json:"avatar_url"`
+	LastSyncedAt time.Time `json:"last_synced_at"`
+}
+
 type Repository struct {
 	ID            int64     `json:"id"`
 	Name          string    `json:"name"`
 	FullName      string    `json:"full_name"`
+	Owner         string    `json:"owner,omitempty"`
+	IsHomeOrg     bool      `json:"is_home_org,omitempty"`
 	Description   string    `json:"description"`
 	PushedAt      time.Time `json:"pushed_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -50,6 +60,8 @@ func (r Repository) LastUpdated() time.Time {
 type PullRequest struct {
 	Number             int       `json:"number"`
 	Repo               string    `json:"repo"`
+	RepoOwner          string    `json:"repo_owner,omitempty"`
+	RepoFullName       string    `json:"repo_full_name,omitempty"`
 	Title              string    `json:"title"`
 	Author             string    `json:"author"`
 	CreatedAt          time.Time `json:"created_at"`
@@ -62,6 +74,17 @@ type PullRequest struct {
 	UnresolvedComments int       `json:"unresolved_comments"`
 	URL                string    `json:"url"`
 	HeadRefName        string    `json:"head_ref_name"`
+}
+
+// DisplayRepo returns the qualified "owner/repo" if available, else Repo.
+func (pr PullRequest) DisplayRepo() string {
+	if pr.RepoFullName != "" {
+		return pr.RepoFullName
+	}
+	if pr.RepoOwner != "" && pr.Repo != "" && !strings.Contains(pr.Repo, "/") {
+		return pr.RepoOwner + "/" + pr.Repo
+	}
+	return pr.Repo
 }
 
 func (pr PullRequest) DaysStale() int {

@@ -124,7 +124,7 @@ func createTestTasksModel() Model {
 func TestTaskSorting_PriorityAndUpdated(t *testing.T) {
 	m := createTestTasksModel()
 
-	display := m.getDisplayTasks()
+	display := m.getSortedPersonalTasks()
 	if len(display) != 4 {
 		t.Fatalf("expected 4 personal tasks, got %d", len(display))
 	}
@@ -141,62 +141,76 @@ func TestTaskSorting_PriorityAndUpdated(t *testing.T) {
 				i, exp, display[i].Number, display[i].Title, display[i].Priority)
 		}
 	}
+
+	squad := m.getSortedSquadTasks()
+	if len(squad) != 2 {
+		t.Fatalf("expected 2 squad tasks, got %d", len(squad))
+	}
+	// Squad task #202 is High, #201 is Med
+	if squad[0].Number != 202 || squad[1].Number != 201 {
+		t.Errorf("expected squad tasks [202, 201], got [%d, %d]", squad[0].Number, squad[1].Number)
+	}
 }
 
-func TestTaskSubtabs_MineAndSquad(t *testing.T) {
+func TestUnifiedTasksTab_MyAndSquadTasks(t *testing.T) {
 	m := createTestTasksModel()
 
-	// 1. Default board is My Tasks
-	if m.ActiveTaskSubtab != TaskSubtabMine {
-		t.Errorf("expected default subtab to be TaskSubtabMine, got %v", m.ActiveTaskSubtab)
-	}
-
 	rendered := m.renderTasksView()
-	// Must contain My Tasks board header and personal tasks
-	if !strings.Contains(rendered, "My Tasks (4)") {
-		t.Errorf("expected rendered view to contain 'My Tasks (4)', got:\n%s", rendered)
+	// Must contain both MY TASKS and SQUAD TASKS sections
+	if !strings.Contains(rendered, "MY TASKS (4)") {
+		t.Errorf("expected rendered view to contain 'MY TASKS (4)', got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "SQUAD TASKS (2)") {
+		t.Errorf("expected rendered view to contain 'SQUAD TASKS (2)', got:\n%s", rendered)
 	}
 	if !strings.Contains(rendered, "High priority personal task (newer)") {
 		t.Errorf("expected rendered view to contain personal task")
 	}
+	if !strings.Contains(rendered, "Squad task assigned to alice") {
+		t.Errorf("expected rendered view to contain alice squad task")
+	}
 
-	// 2. Switch board to Squad Tasks via 'l'
+	// Initial cursor is at top of personal tasks (0)
+	if m.TaskCursor != 0 {
+		t.Errorf("expected initial TaskCursor == 0, got %d", m.TaskCursor)
+	}
+
+	// Jump to top of Squad Tasks via 'l'
 	updated, _ := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
 	m = updated.(Model)
-	if m.ActiveTab != TabSquadTasks {
-		t.Errorf("expected ActiveTab == TabSquadTasks after 'l', got %v", m.ActiveTab)
+	if m.TaskCursor != 4 {
+		t.Errorf("expected TaskCursor == 4 after 'l', got %d", m.TaskCursor)
 	}
 
-	squadRendered := m.renderTasksView()
-	if !strings.Contains(squadRendered, "Squad Tasks") || !strings.Contains(squadRendered, "(2)") {
-		t.Errorf("expected squad view to contain 'Squad Tasks' and '(2)', got:\n%s", squadRendered)
-	}
-	if !strings.Contains(squadRendered, "Squad task assigned to alice") {
-		t.Errorf("expected squad view to contain alice squad task")
-	}
-	if !strings.Contains(squadRendered, "Squad task unassigned") {
-		t.Errorf("expected squad view to contain unassigned squad task")
-	}
-
-	// 3. Switch back to My Tasks via 'h'
+	// Jump back to top of My Tasks via 'h'
 	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
 	m = updated.(Model)
-	if m.ActiveTab != TabMyTasks {
-		t.Errorf("expected ActiveTab == TabMyTasks after 'h', got %v", m.ActiveTab)
+	if m.TaskCursor != 0 {
+		t.Errorf("expected TaskCursor == 0 after 'h', got %d", m.TaskCursor)
 	}
 }
 
 func TestTaskInlineAddingAndCreation(t *testing.T) {
 	m := createTestTasksModel()
 
-	// 1. Press 'a' to add task inline
-	res, cmd := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	// 1. Press 'a' to enter create leader mode
+	res, _ := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = res.(Model)
+	if m.TaskLeaderMode != TaskLeaderCreate {
+		t.Fatalf("expected TaskLeaderMode == TaskLeaderCreate after 'a', got %v", m.TaskLeaderMode)
+	}
+
+	// 2. Press 'm' to choose My Task
+	res, cmd := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
 	m = res.(Model)
 	if cmd == nil {
-		t.Errorf("expected textinput blink command on 'a'")
+		t.Errorf("expected textinput blink command on 'm'")
 	}
 	if !m.InlineAdding {
-		t.Fatalf("expected InlineAdding == true after pressing 'a'")
+		t.Fatalf("expected InlineAdding == true after choosing 'm'")
+	}
+	if m.TaskCreateTarget != TaskTargetPersonal {
+		t.Errorf("expected TaskCreateTarget == TaskTargetPersonal, got %v", m.TaskCreateTarget)
 	}
 	if m.InlineNewPriority != github.PriorityMedium {
 		t.Errorf("expected default priority Medium, got %v", m.InlineNewPriority)
@@ -208,7 +222,7 @@ func TestTaskInlineAddingAndCreation(t *testing.T) {
 		t.Errorf("expected view to render (new) row while inline adding")
 	}
 
-	// 2. Type title and press Enter to submit
+	// 3. Type title and press Enter to submit
 	m.InlineNewTitleInput.SetValue("Buy new test hardware")
 	res, cmd = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEnter})
 	m = res.(Model)
@@ -219,7 +233,7 @@ func TestTaskInlineAddingAndCreation(t *testing.T) {
 		t.Errorf("expected InlineAdding == false after submitting")
 	}
 
-	// 3. Deliver TaskCreatedMsg
+	// 4. Deliver TaskCreatedMsg
 	newTask := github.Task{
 		ID:          99,
 		Number:      105,
@@ -233,6 +247,86 @@ func TestTaskInlineAddingAndCreation(t *testing.T) {
 
 	if len(m.PersonalTasks) != 5 {
 		t.Errorf("expected 5 personal tasks after creation, got %d", len(m.PersonalTasks))
+	}
+
+	// 5. Test 'a' -> 's' for Squad Task
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = res.(Model)
+	if !m.InlineAdding || m.TaskCreateTarget != TaskTargetSquad {
+		t.Fatalf("expected InlineAdding for squad task, got adding=%v target=%v", m.InlineAdding, m.TaskCreateTarget)
+	}
+	// Cancel via Esc
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEsc})
+	m = res.(Model)
+	if m.InlineAdding {
+		t.Errorf("expected InlineAdding cancelled by Esc")
+	}
+}
+
+func TestTaskLeaderGo(t *testing.T) {
+	m := createTestTasksModel()
+	m.TaskCursor = 1 // Start at index 1
+
+	// 1. Press 'g' -> 'f' jumps to first
+	res, _ := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = res.(Model)
+	if m.TaskLeaderMode != TaskLeaderGo {
+		t.Fatalf("expected TaskLeaderMode == TaskLeaderGo after 'g', got %v", m.TaskLeaderMode)
+	}
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = res.(Model)
+	if m.TaskLeaderMode != TaskLeaderNone || m.TaskCursor != 0 {
+		t.Errorf("expected cursor 0 after 'g'->'f', got %d", m.TaskCursor)
+	}
+
+	// 2. Press 'g' -> 'l' jumps to last
+	totalRows := m.getTotalTaskRows()
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = res.(Model)
+	if m.TaskCursor != totalRows-1 {
+		t.Errorf("expected cursor %d after 'g'->'l', got %d", totalRows-1, m.TaskCursor)
+	}
+
+	// 3. Press 'g' -> '1', '0', '4' -> Enter jumps to task #104
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'0'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(Model)
+	_, target := m.getCursorTarget()
+	if target == nil || target.Number != 104 {
+		t.Errorf("expected cursor on task #104, got %+v", target)
+	}
+
+	// 4. Invalid number handled gracefully with toast
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m = res.(Model)
+	if !strings.Contains(m.StatusMsg, "not found") {
+		t.Errorf("expected status msg 'not found', got: %s", m.StatusMsg)
+	}
+
+	// 5. Cancel 'g' leader with Esc
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = res.(Model)
+	res, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEsc})
+	m = res.(Model)
+	if m.TaskLeaderMode != TaskLeaderNone {
+		t.Errorf("expected leader cancelled after Esc")
 	}
 }
 
@@ -572,8 +666,8 @@ func TestTaskActiveAndDoneOnSamePage(t *testing.T) {
 	}
 
 	// 2. Move cursor down into completed tasks
-	// Active tasks = 4 (indices 0..3). Completed tasks = 2 (indices 4..5).
-	m.TaskCursor = 4 // On first completed task (#302, most recently closed)
+	// Active tasks = 4 personal + 2 squad = 6 (indices 0..5). Completed tasks = 2 (indices 6..7).
+	m.TaskCursor = len(m.getActiveTasks()) // On first completed task (#302, most recently closed)
 	loc, task := m.getCursorTarget()
 	if loc != locCompletedTask || task == nil || task.Number != 302 {
 		t.Fatalf("expected cursor on completed task #302, got loc=%v, task=%v", loc, task)
@@ -754,11 +848,14 @@ func TestPRReviewTask_OpenModalFromPRView(t *testing.T) {
 		t.Errorf("expected unassigned review task, got assignees %v", created.Assignees)
 	}
 
-	// Verify Squad Tasks page renders OUTSTANDING REVIEWS table
-	m.ActiveTab = TabSquadTasks
+	// Verify Tasks page renders in SQUAD TASKS table
+	m.ActiveTab = TabTasks
 	tasksView := m.renderTasksView()
-	if !strings.Contains(tasksView, "OUTSTANDING REVIEWS") {
-		t.Errorf("expected OUTSTANDING REVIEWS header in squad tasks view, got:\n%s", tasksView)
+	if !strings.Contains(tasksView, "SQUAD TASKS") {
+		t.Errorf("expected SQUAD TASKS header in tasks view, got:\n%s", tasksView)
+	}
+	if !strings.Contains(tasksView, "Review PR #42") {
+		t.Errorf("expected Review PR #42 in tasks view, got:\n%s", tasksView)
 	}
 	if !strings.Contains(tasksView, "Unassigned") {
 		t.Errorf("expected Unassigned in squad tasks view, got:\n%s", tasksView)
@@ -788,8 +885,8 @@ func TestPRReviewTask_SpecialRenderingAndContextualEnter(t *testing.T) {
 	}
 	m.SquadTasks = append([]github.Task{prTask}, m.SquadTasks...)
 
-	// Top task is now the PR review task
-	m.TaskCursor = 0
+	// Cursor placed on the squad PR review task
+	m.TaskCursor = len(m.getSortedPersonalTasks())
 	_, cursorTask := m.getCursorTarget()
 	if cursorTask == nil || !cursorTask.IsPRReview() {
 		t.Fatalf("expected cursor task to be a PR review task")
@@ -970,7 +1067,7 @@ func TestTask_HotkeyI_OpensIssue(t *testing.T) {
 		IsSquadTask: true,
 	}
 	m.SquadTasks = append([]github.Task{prTask}, m.SquadTasks...)
-	m.TaskCursor = 0 // On PR task
+	m.TaskCursor = len(m.getSortedPersonalTasks()) // On PR task
 
 	// 1. Press 'i' on PR task -> MUST open issue URL (NOT the PR URL!)
 	res, cmdI := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
@@ -1004,7 +1101,7 @@ func TestSquadTask_CapitalA_AssignMultiple(t *testing.T) {
 	m.ActiveTaskSubtab = TaskSubtabSquad
 	m.Width = 100
 	m.Height = 30
-	m.TaskCursor = 0 // On #202 (unassigned)
+	m.TaskCursor = len(m.getSortedPersonalTasks()) // On #202 (unassigned)
 
 	// 1. Press capital 'A' on active squad task to open Assign Squad Task modal
 	res, _ := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
@@ -1111,7 +1208,7 @@ func TestPRReviewTask_LaunchAutoUnassignsMultiples(t *testing.T) {
 		IsSquadTask: true,
 	}
 	m.SquadTasks = append([]github.Task{multiAssigneePRTask}, m.SquadTasks...)
-	m.TaskCursor = 0 // On multiAssigneePRTask
+	m.TaskCursor = len(m.getSortedPersonalTasks()) // On multiAssigneePRTask
 
 	// 1. Press 'Enter' to launch review -> MUST unassign everyone but simonbronner!
 	res, enterCmd := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEnter})
@@ -1150,7 +1247,7 @@ func TestPRReviewTask_LaunchAutoUnassignsMultiples(t *testing.T) {
 		IsSquadTask: true,
 	}
 	m.SquadTasks = append([]github.Task{multiAssigneePRTask2}, m.SquadTasks...)
-	m.TaskCursor = 0 // On multiAssigneePRTask2
+	m.TaskCursor = len(m.getSortedPersonalTasks()) // On multiAssigneePRTask2
 
 	res, oCmd := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	m = res.(Model)
@@ -1370,24 +1467,24 @@ func TestCentralizedTasksAndSquadLabeling(t *testing.T) {
 	}
 }
 
-func TestSquadTasks_OutstandingReviewsTableAndAutoClaim(t *testing.T) {
+func TestSquadTasks_ReviewRenderingAndAutoClaim(t *testing.T) {
 	m := createTestTasksModel()
-	m.ActiveTab = TabSquadTasks
-	m.ActiveTaskSubtab = TaskSubtabSquad
+	m.ActiveTab = TabTasks
+	m.PersonalTasks = nil // Focus test on squad tasks
 	m.AuthUser = "alice"
 
-	// Create 2 squad tasks: 1 unassigned review, 1 regular task
+	// Create 2 squad tasks: 1 unassigned review (High priority), 1 regular task (Medium priority)
 	m.SquadTasks = []github.Task{
 		{
 			ID:          101,
 			Number:      101,
 			Title:       "Implement auth caching",
 			RepoName:    "core-svc",
-			Priority:    github.PriorityHigh,
+			Priority:    github.PriorityMedium,
 			Labels:      []string{"feature"},
 			Assignees:   []string{"bob"},
 			State:       "open",
-			UpdatedAt:   time.Now(),
+			UpdatedAt:   time.Now().Add(-10 * time.Minute),
 			IsSquadTask: true,
 		},
 		{
@@ -1396,7 +1493,7 @@ func TestSquadTasks_OutstandingReviewsTableAndAutoClaim(t *testing.T) {
 			Title:       "Review PR #42: Fix DB leak (core-svc)",
 			Body:        "Review pull request: https://github.com/acme/core-svc/pull/42",
 			RepoName:    "core-svc",
-			Priority:    github.PriorityMedium,
+			Priority:    github.PriorityHigh,
 			Labels:      []string{github.LabelPRReview},
 			Assignees:   []string{}, // Unassigned review!
 			State:       "open",
@@ -1405,19 +1502,20 @@ func TestSquadTasks_OutstandingReviewsTableAndAutoClaim(t *testing.T) {
 		},
 	}
 
-	// 1. Verify rendering has OUTSTANDING REVIEWS and SQUAD TASKS sections
+	// 1. Verify rendering has SQUAD TASKS section and displays review task with Unassigned
 	view := m.renderTasksView()
-	if !strings.Contains(view, "OUTSTANDING REVIEWS") {
-		t.Fatalf("expected view to contain OUTSTANDING REVIEWS header, got:\n%s", view)
-	}
 	if !strings.Contains(view, "SQUAD TASKS") {
 		t.Fatalf("expected view to contain SQUAD TASKS header, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Review PR #42") {
+		t.Fatalf("expected view to display review task, got:\n%s", view)
 	}
 	if !strings.Contains(view, "Unassigned") {
 		t.Fatalf("expected view to display 'Unassigned' review, got:\n%s", view)
 	}
 
-	// 2. Reviews should come first in cursor order (cursor 0 = Review PR #102)
+	// 2. High priority review comes first (cursor 0 = Review PR #102)
+	m.TaskCursor = 0
 	loc, cursorTask := m.getCursorTarget()
 	if loc != locActiveTask || cursorTask == nil || cursorTask.ID != 102 {
 		t.Fatalf("expected cursor 0 to point to review task 102, got loc %v, task %+v", loc, cursorTask)
@@ -1448,15 +1546,171 @@ func TestSquadTasks_OutstandingReviewsTableAndAutoClaim(t *testing.T) {
 		t.Fatalf("expected task 102 to be claimed by alice, got assignees %v", task102.Assignees)
 	}
 
-	// 4. Press 'a' to add new task inline -> cursor lands at index 1 (right after reviews)
+	// 4. Press 'a' -> 's' to add new squad task inline
 	updatedA, _ := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	m = updatedA.(Model)
-	if !m.InlineAdding {
-		t.Fatalf("expected InlineAdding to be true")
+	if m.TaskLeaderMode != TaskLeaderCreate {
+		t.Fatalf("expected TaskLeaderCreate mode on 'a'")
+	}
+	updatedS, _ := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updatedS.(Model)
+	if !m.InlineAdding || m.TaskCreateTarget != TaskTargetSquad {
+		t.Fatalf("expected InlineAdding for squad task on 's'")
 	}
 	locA, _ := m.getCursorTarget()
 	if locA != locInlineNew {
 		t.Fatalf("expected cursor target to be locInlineNew, got %v", locA)
+	}
+}
+
+func TestReactiveEntityFlashIndicator(t *testing.T) {
+	m := createTestTasksModel()
+	now := time.Now()
+
+	// 1. Initial state: nothing flashing
+	flashing, _ := m.isEntityFlashing("task:tasks#103")
+	if flashing {
+		t.Fatalf("expected task not to be flashing initially")
+	}
+
+	// 2. Record entity flash
+	m.recordEntityFlash("task:tasks#103")
+	flashing, color := m.isEntityFlashing("task:tasks#103")
+	if !flashing {
+		t.Fatalf("expected task:tasks#103 to be flashing after recordEntityFlash")
+	}
+	if color == "" {
+		t.Errorf("expected non-empty lipgloss color during flash")
+	}
+
+	// 3. Render tasks view and verify lightning bolt indicator '⚡' is present
+	view := m.renderTasksView()
+	if !strings.Contains(view, "⚡") {
+		t.Errorf("expected view to contain '⚡' indicator for flashing task, got:\n%s", view)
+	}
+
+	// 4. Test expired flash (older than 2.5 seconds)
+	m.EntityFlashUpdates["task:tasks#103"] = now.Add(-3 * time.Second)
+	flashingExpired, _ := m.isEntityFlashing("task:tasks#103")
+	if flashingExpired {
+		t.Errorf("expected flashing to expire after 2.5s")
+	}
+}
+
+func TestTaskLeaderGo_VisibleNumberLabelsAndCollapsedIgnored(t *testing.T) {
+	m := createTestTasksModel()
+	now := time.Now()
+	closedTime := now.Add(-5 * time.Minute)
+
+	m.PersonalDoneTasks = []github.Task{
+		{
+			ID:          301,
+			Number:      999,
+			Title:       "Completed task hidden by default",
+			State:       "closed",
+			Priority:    github.PriorityMedium,
+			ClosedAt:    &closedTime,
+			UpdatedAt:   closedTime,
+			RepoName:    "tasks",
+			IsSquadTask: false,
+		},
+	}
+
+	// 1. Completed tasks collapsed by default
+	m.TaskCollapseCompleted = true
+
+	// Check rendering normal view
+	view := m.renderTasksView()
+	if !strings.Contains(view, "▶ COMPLETED") {
+		t.Fatalf("expected view to show collapsed completed header '▶ COMPLETED', got:\n%s", view)
+	}
+	if strings.Contains(view, "Completed task hidden by default") {
+		t.Fatalf("expected completed task to NOT be rendered when collapsed")
+	}
+
+	// 2. Press 'g' to enter TaskLeaderGo
+	updated, _ := m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = updated.(Model)
+	if m.TaskLeaderMode != TaskLeaderGo {
+		t.Fatalf("expected TaskLeaderGo mode")
+	}
+
+	// 3. In TaskLeaderGo, verify visible number labels [1], [2], etc. are rendered next to tasks
+	viewGo := m.renderTasksView()
+	if !strings.Contains(viewGo, "[1]") || !strings.Contains(viewGo, "[2]") {
+		t.Fatalf("expected view in TaskLeaderGo to render visible number labels [1], [2], got:\n%s", viewGo)
+	}
+
+	// 4. Try to navigate to collapsed completed task #999
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	// Since #999 is collapsed, it must be ignored by [g] navigation!
+	if !strings.Contains(m.StatusMsg, "not found or collapsed") {
+		t.Fatalf("expected status message to indicate task not found or collapsed, got: %s", m.StatusMsg)
+	}
+
+	// 5. Navigate to visible task [2] using number 2
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.TaskCursor != 1 {
+		t.Fatalf("expected TaskCursor to be 1 (for task [2]), got %d", m.TaskCursor)
+	}
+
+	// 6. Press 'D' to toggle expand completed tasks
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	m = updated.(Model)
+	if m.TaskCollapseCompleted {
+		t.Fatalf("expected TaskCollapseCompleted to be false after 'D'")
+	}
+	viewExpanded := m.renderTasksView()
+	if !strings.Contains(viewExpanded, "Completed task hidden by default") {
+		t.Fatalf("expected completed task to be rendered when expanded")
+	}
+
+	// 7. Now with completed tasks expanded, navigating to task #999 succeeds!
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	loc, task := m.getCursorTarget()
+	if loc != locCompletedTask || task == nil || task.Number != 999 {
+		t.Fatalf("expected cursor on completed task #999 after expanding, got loc %v, task %v", loc, task)
+	}
+
+	// 8. Test 'f' (first) and 'l' (last) in TaskLeaderGo
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	if m.TaskCursor != 0 {
+		t.Fatalf("expected cursor 0 on 'f', got %d", m.TaskCursor)
+	}
+
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = updated.(Model)
+	updated, _ = m.handleTasksKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.TaskCursor != len(m.getVisibleTaskItems())-1 {
+		t.Fatalf("expected cursor on last visible item on 'l', got %d", m.TaskCursor)
 	}
 }
 

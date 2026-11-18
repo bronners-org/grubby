@@ -13,7 +13,9 @@ type RepoColumns struct {
 
 	NameWidth    int
 	SummaryWidth int
+	GitWidth     int
 	SessionWidth int
+	LastWidth    int
 	PathWidth    int
 
 	// Backward compatibility aliases
@@ -58,7 +60,9 @@ func computeRepoColumns(termWidth int) RepoColumns {
 		Path:         colStyle(pathW),
 		NameWidth:    nameW,
 		SummaryWidth: summaryW,
+		GitWidth:     16,
 		SessionWidth: 12,
+		LastWidth:    13,
 		PathWidth:    pathW,
 
 		// Backward compatibility aliases

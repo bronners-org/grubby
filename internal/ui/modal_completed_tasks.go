@@ -13,11 +13,8 @@ import (
 
 func (m Model) getSortedDoneTasks() []github.Task {
 	var list []github.Task
-	if !m.isSquadTasks() {
-		list = append(list, m.PersonalDoneTasks...)
-	} else {
-		list = append(list, m.SquadDoneTasks...)
-	}
+	list = append(list, m.PersonalDoneTasks...)
+	list = append(list, m.SquadDoneTasks...)
 
 	sort.SliceStable(list, func(i, j int) bool {
 		timeI := list[i].UpdatedAt
@@ -39,12 +36,7 @@ func (m Model) getSortedDoneTasks() []github.Task {
 
 func (m Model) renderCompletedTasksModal() string {
 	list := m.getSortedDoneTasks()
-
-	subtabName := "My Tasks"
-	if m.isSquadTasks() {
-		subtabName = "Squad Tasks"
-	}
-	title := ModalTitleStyle.Render(fmt.Sprintf("Completed Tasks (%d) — %s", len(list), subtabName))
+	title := ModalTitleStyle.Render(fmt.Sprintf("Completed Tasks (%d)", len(list)))
 
 	if len(list) == 0 {
 		emptyMsg := "  No completed tasks found.\n\n  Complete an active task with [Space] to see it here!\n"

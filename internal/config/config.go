@@ -12,11 +12,12 @@ import (
 )
 
 type SquadConfig struct {
-	Name        string   `yaml:"name"`
-	DisplayName string   `yaml:"display_name"`
-	GithubTeam  string   `yaml:"github_team,omitempty"`
-	Members     []string `yaml:"members"`
-	Repos       []string `yaml:"repos,omitempty"`
+	Name          string   `yaml:"name"`
+	DisplayName   string   `yaml:"display_name"`
+	GithubTeam    string   `yaml:"github_team,omitempty"`
+	Members       []string `yaml:"members"`
+	Organizations []string `yaml:"organizations,omitempty"`
+	Repos         []string `yaml:"repos,omitempty"`
 }
 
 type GroupConfig struct {
@@ -30,20 +31,29 @@ type SearchConfig struct {
 	IgnoreDirs []string `yaml:"ignore_dirs"`
 }
 
+type WebhookConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Port    int    `yaml:"port"` // Default: 8484
+	Path    string `yaml:"path"` // Default: "/webhooks/github"
+}
+
 type Config struct {
-	Version            int            `yaml:"version"`
-	DefaultOrg         string         `yaml:"default_org"`
-	WorkspaceDir       string         `yaml:"workspace_dir"`
-	Editor             string         `yaml:"editor"`
-	ActiveSquad        string         `yaml:"active_squad"`
-	Squads             []SquadConfig  `yaml:"squads"`
-	Groups             []GroupConfig  `yaml:"groups"`
+	Version            int                  `yaml:"version"`
+	DefaultOrg         string               `yaml:"default_org"` // Fallback / legacy
+	HomeOrg            string               `yaml:"home_org,omitempty"`
+	TrackedOrgs        []string             `yaml:"tracked_orgs,omitempty"`
+	Webhook            WebhookConfig        `yaml:"webhook,omitempty"`
+	WorkspaceDir       string               `yaml:"workspace_dir"`
+	Editor             string               `yaml:"editor"`
+	ActiveSquad        string               `yaml:"active_squad"`
+	Squads             []SquadConfig        `yaml:"squads"`
+	Groups             []GroupConfig        `yaml:"groups"`
 	Search             SearchConfig         `yaml:"search"`
 	RepoInteractions   map[string]time.Time `yaml:"repo_interactions,omitempty"`
 	Proxy              string               `yaml:"proxy,omitempty"`
-	InsecureSkipVerify bool           `yaml:"insecure_skip_verify,omitempty"`
-	HiddenRepos        []string       `yaml:"hidden_repos,omitempty"`
-	CentralTasksRepo   string         `yaml:"central_tasks_repo,omitempty"`
+	InsecureSkipVerify bool                 `yaml:"insecure_skip_verify,omitempty"`
+	HiddenRepos        []string             `yaml:"hidden_repos,omitempty"`
+	CentralTasksRepo   string               `yaml:"central_tasks_repo,omitempty"`
 
 	filePath string     `yaml:"-"`
 	mu       sync.Mutex `yaml:"-"`
@@ -56,6 +66,20 @@ func DefaultConfigPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".config", "grubby", "config.yaml"), nil
+}
+
+// Exists returns true if the configuration file exists at path (or default path)
+func Exists(path string) bool {
+	if path == "" {
+		var err error
+		path, err = DefaultConfigPath()
+		if err != nil {
+			return false
+		}
+	}
+	path = ExpandHome(path)
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
 }
 
 // ExpandHome expands leading ~ in file paths
@@ -93,6 +117,11 @@ func Load(path string) (*Config, error) {
 		Version:      1,
 		WorkspaceDir: "~/workspaces",
 		Editor:       os.Getenv("EDITOR"),
+		Webhook: WebhookConfig{
+			Enabled: true,
+			Port:    8484,
+			Path:    "/webhooks/github",
+		},
 		Search: SearchConfig{
 			Engine: "ripgrep",
 			IgnoreDirs: []string{
@@ -119,6 +148,15 @@ func Load(path string) (*Config, error) {
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("invalid config format in %s: %w", path, err)
+	}
+	if cfg.Webhook.Port == 0 {
+		cfg.Webhook.Port = 8484
+	}
+	if cfg.Webhook.Path == "" {
+		cfg.Webhook.Path = "/webhooks/github"
+	}
+	if cfg.HomeOrg == "" && cfg.DefaultOrg != "" {
+		cfg.HomeOrg = cfg.DefaultOrg
 	}
 	cfg.filePath = path
 	return cfg, nil
@@ -433,6 +471,130 @@ func (c *Config) SetSquadMembers(squadName string, members []string) error {
 	return fmt.Errorf("squad '%s' not found", squadName)
 }
 
+// Squad Organization Helpers
+
+func (c *Config) GetOrgsForSquad(squadName string) []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, s := range c.Squads {
+		if strings.EqualFold(s.Name, squadName) {
+			return append([]string{}, s.Organizations...)
+		}
+	}
+	return nil
+}
+
+func (c *Config) AddOrgToSquad(squadName, org string) error {
+	c.mu.Lock()
+	cleanOrg := strings.TrimSpace(org)
+	if cleanOrg == "" {
+		c.mu.Unlock()
+		return fmt.Errorf("organization name cannot be empty")
+	}
+
+	for i := range c.Squads {
+		if strings.EqualFold(c.Squads[i].Name, squadName) {
+			for _, o := range c.Squads[i].Organizations {
+				if strings.EqualFold(o, cleanOrg) {
+					c.mu.Unlock()
+					return nil // already exists
+				}
+			}
+			c.Squads[i].Organizations = append(c.Squads[i].Organizations, cleanOrg)
+			c.mu.Unlock()
+			return c.Save()
+		}
+	}
+	c.mu.Unlock()
+	return fmt.Errorf("squad '%s' not found", squadName)
+}
+
+func (c *Config) RemoveOrgFromSquad(squadName, org string) error {
+	c.mu.Lock()
+	cleanOrg := strings.TrimSpace(org)
+
+	for i := range c.Squads {
+		if strings.EqualFold(c.Squads[i].Name, squadName) {
+			var updated []string
+			for _, o := range c.Squads[i].Organizations {
+				if !strings.EqualFold(o, cleanOrg) {
+					updated = append(updated, o)
+				}
+			}
+			c.Squads[i].Organizations = updated
+			c.mu.Unlock()
+			return c.Save()
+		}
+	}
+	c.mu.Unlock()
+	return fmt.Errorf("squad '%s' not found", squadName)
+}
+
+func (c *Config) SetSquadOrgs(squadName string, orgs []string) error {
+	c.mu.Lock()
+
+	for i := range c.Squads {
+		if strings.EqualFold(c.Squads[i].Name, squadName) {
+			var clean []string
+			seen := make(map[string]bool)
+			for _, o := range orgs {
+				trimmed := strings.TrimSpace(o)
+				if trimmed != "" && !seen[strings.ToLower(trimmed)] {
+					seen[strings.ToLower(trimmed)] = true
+					clean = append(clean, trimmed)
+				}
+			}
+			c.Squads[i].Organizations = clean
+			c.mu.Unlock()
+			return c.Save()
+		}
+	}
+	c.mu.Unlock()
+	return fmt.Errorf("squad '%s' not found", squadName)
+}
+
+func (c *Config) GetActiveSquadOrgs() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, s := range c.Squads {
+		if strings.EqualFold(s.Name, c.ActiveSquad) {
+			if len(s.Organizations) > 0 {
+				var orgs []string
+				seen := make(map[string]bool)
+				for _, o := range s.Organizations {
+					clean := strings.TrimSpace(o)
+					if clean != "" && !seen[strings.ToLower(clean)] {
+						seen[strings.ToLower(clean)] = true
+						orgs = append(orgs, clean)
+					}
+				}
+				if len(orgs) > 0 {
+					return orgs
+				}
+			}
+			break
+		}
+	}
+
+	// Fallback to HomeOrg or DefaultOrg
+	home := c.HomeOrg
+	if home == "" {
+		home = c.DefaultOrg
+	}
+	if home != "" {
+		return []string{home}
+	}
+	return nil
+}
+
 // Squad Repo Ownership Helpers
 
 func (c *Config) IsRepoOwnedBySquad(squadName, repoName string) bool {
@@ -634,12 +796,123 @@ func (c *Config) ToggleRepoHidden(repoName string) (bool, error) {
 	return nowHidden, err
 }
 
+// GetHomeOrg returns HomeOrg if set, otherwise falls back to DefaultOrg.
+func (c *Config) GetHomeOrg() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.HomeOrg != "" {
+		return c.HomeOrg
+	}
+	return c.DefaultOrg
+}
+
+// SetHomeOrg sets the primary home organization and saves config.
+func (c *Config) SetHomeOrg(org string) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	c.HomeOrg = strings.TrimSpace(org)
+	if c.DefaultOrg == "" {
+		c.DefaultOrg = c.HomeOrg
+	}
+	c.mu.Unlock()
+	return c.Save()
+}
+
+// GetTrackedOrgs returns all configured tracked organizations.
+// It includes HomeOrg, DefaultOrg, active squad organizations, and any explicit TrackedOrgs.
+func (c *Config) GetTrackedOrgs() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	seen := make(map[string]bool)
+	var result []string
+
+	if c.HomeOrg != "" {
+		seen[strings.ToLower(c.HomeOrg)] = true
+		result = append(result, c.HomeOrg)
+	}
+	if c.DefaultOrg != "" && !seen[strings.ToLower(c.DefaultOrg)] {
+		seen[strings.ToLower(c.DefaultOrg)] = true
+		result = append(result, c.DefaultOrg)
+	}
+
+	for _, s := range c.Squads {
+		if strings.EqualFold(s.Name, c.ActiveSquad) {
+			for _, o := range s.Organizations {
+				clean := strings.TrimSpace(o)
+				if clean != "" && !seen[strings.ToLower(clean)] {
+					seen[strings.ToLower(clean)] = true
+					result = append(result, clean)
+				}
+			}
+			break
+		}
+	}
+
+	for _, o := range c.TrackedOrgs {
+		clean := strings.TrimSpace(o)
+		if clean != "" && !seen[strings.ToLower(clean)] {
+			seen[strings.ToLower(clean)] = true
+			result = append(result, clean)
+		}
+	}
+	return result
+}
+
+// AddTrackedOrg adds an organization to tracked_orgs if not present and persists config.
+func (c *Config) AddTrackedOrg(org string) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	clean := strings.TrimSpace(org)
+	if clean == "" {
+		c.mu.Unlock()
+		return nil
+	}
+	for _, o := range c.TrackedOrgs {
+		if strings.EqualFold(o, clean) {
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	c.TrackedOrgs = append(c.TrackedOrgs, clean)
+	c.mu.Unlock()
+	return c.Save()
+}
+
+// RemoveTrackedOrg removes an organization from tracked_orgs and persists config.
+func (c *Config) RemoveTrackedOrg(org string) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	clean := strings.TrimSpace(org)
+	var updated []string
+	for _, o := range c.TrackedOrgs {
+		if !strings.EqualFold(o, clean) {
+			updated = append(updated, o)
+		}
+	}
+	c.TrackedOrgs = updated
+	c.mu.Unlock()
+	return c.Save()
+}
+
 // Central Tasks Repository Helpers
 
 // GetCentralTasksRepo resolves the owner and repo name for the central tasks repository.
 // If central_tasks_repo is configured as "owner/repo", it returns (owner, repo).
-// If configured as "repo", it returns (defaultOrg or c.DefaultOrg, repo).
-// If unset, it defaults to (defaultOrg or c.DefaultOrg, "grubby-tasks").
+// If configured as "repo", it returns (homeOrg or defaultOrg or c.DefaultOrg, repo).
+// If unset, it defaults to (homeOrg or defaultOrg or c.DefaultOrg, "grubby-tasks").
 func (c *Config) GetCentralTasksRepo(defaultOrg string) (owner, repo string) {
 	if c == nil {
 		if defaultOrg != "" {
@@ -653,7 +926,10 @@ func (c *Config) GetCentralTasksRepo(defaultOrg string) (owner, repo string) {
 
 	tasksRepo := strings.TrimSpace(c.CentralTasksRepo)
 	if tasksRepo == "" {
-		org := defaultOrg
+		org := c.HomeOrg
+		if org == "" {
+			org = defaultOrg
+		}
 		if org == "" {
 			org = c.DefaultOrg
 		}
@@ -665,7 +941,10 @@ func (c *Config) GetCentralTasksRepo(defaultOrg string) (owner, repo string) {
 		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 	}
 
-	org := defaultOrg
+	org := c.HomeOrg
+	if org == "" {
+		org = defaultOrg
+	}
 	if org == "" {
 		org = c.DefaultOrg
 	}

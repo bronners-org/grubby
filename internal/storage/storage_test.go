@@ -617,5 +617,372 @@ func TestSquadsStorage(t *testing.T) {
 	}
 }
 
+func TestMultiOrgRepositoriesAndScoping(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	now := time.Now()
+	// Two repositories with the SAME short name in DIFFERENT organizations
+	repos := []github.Repository{
+		{
+			Name:          "api-gateway",
+			FullName:      "acme-corp/api-gateway",
+			Owner:         "acme-corp",
+			IsHomeOrg:     true,
+			Description:   "Acme API gateway",
+			PushedAt:      now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			DefaultBranch: "main",
+			IsPrivate:     true,
+		},
+		{
+			Name:          "api-gateway",
+			FullName:      "client-co/api-gateway",
+			Owner:         "client-co",
+			IsHomeOrg:     false,
+			Description:   "Client API gateway",
+			PushedAt:      now.Add(-2 * time.Hour),
+			UpdatedAt:     now.Add(-2 * time.Hour),
+			DefaultBranch: "master",
+			IsPrivate:     false,
+		},
+	}
+
+	if err := db.SaveRepositories(repos, ""); err != nil {
+		t.Fatalf("SaveRepositories failed: %v", err)
+	}
+
+	allRepos, err := db.GetRepositories()
+	if err != nil {
+		t.Fatalf("GetRepositories failed: %v", err)
+	}
+	if len(allRepos) != 2 {
+		t.Fatalf("expected 2 repositories across orgs, got %d", len(allRepos))
+	}
+
+	// Verify Home Org flag preserved
+	foundHome := false
+	for _, r := range allRepos {
+		if r.FullName == "acme-corp/api-gateway" {
+			if !r.IsHomeOrg {
+				t.Errorf("expected acme-corp/api-gateway to be marked as Home Org")
+			}
+			foundHome = true
+		}
+	}
+	if !foundHome {
+		t.Errorf("expected to find acme-corp/api-gateway")
+	}
+
+	// Filter by org
+	acmeRepos, err := db.GetRepositoriesByOrg("acme-corp")
+	if err != nil || len(acmeRepos) != 1 {
+		t.Fatalf("expected 1 repo for acme-corp, got %d", len(acmeRepos))
+	}
+	if acmeRepos[0].FullName != "acme-corp/api-gateway" {
+		t.Errorf("unexpected repo: %s", acmeRepos[0].FullName)
+	}
+
+	// Lookup by full name and short name
+	byFull, err := db.GetRepoByName("client-co/api-gateway")
+	if err != nil || byFull == nil {
+		t.Fatalf("GetRepoByName by full name failed: %v", err)
+	}
+	if byFull.Owner != "client-co" {
+		t.Errorf("expected client-co, got %s", byFull.Owner)
+	}
+
+	// Delete single repo without affecting other org's same-named repo
+	if err := db.DeleteRepository("client-co/api-gateway"); err != nil {
+		t.Fatalf("DeleteRepository failed: %v", err)
+	}
+
+	remaining, _ := db.GetRepositories()
+	if len(remaining) != 1 || remaining[0].FullName != "acme-corp/api-gateway" {
+		t.Fatalf("expected only acme-corp/api-gateway to remain, got %+v", remaining)
+	}
+}
+
+func TestMultiOrgPullRequests(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	now := time.Now()
+	prs := []github.PullRequest{
+		{
+			Number:       101,
+			Repo:         "api-gateway",
+			RepoOwner:    "acme-corp",
+			RepoFullName: "acme-corp/api-gateway",
+			Title:        "Refactor auth",
+			Author:       "alice",
+			CreatedAt:    now.Add(-1 * time.Hour),
+			UpdatedAt:    now.Add(-1 * time.Hour),
+			State:        "OPEN",
+		},
+		{
+			Number:       101,
+			Repo:         "api-gateway",
+			RepoOwner:    "client-co",
+			RepoFullName: "client-co/api-gateway",
+			Title:        "Client PR #101",
+			Author:       "bob",
+			CreatedAt:    now.Add(-2 * time.Hour),
+			UpdatedAt:    now.Add(-2 * time.Hour),
+			State:        "OPEN",
+		},
+	}
+
+	// Save individual PR via SavePullRequest
+	for _, pr := range prs {
+		if err := db.SavePullRequest(pr); err != nil {
+			t.Fatalf("SavePullRequest failed: %v", err)
+		}
+	}
+
+	loadedPRs, err := db.GetPullRequests()
+	if err != nil {
+		t.Fatalf("GetPullRequests failed: %v", err)
+	}
+	if len(loadedPRs) == 0 {
+		t.Fatalf("expected PRs, got none")
+	}
+
+	// DisplayRepo helper check
+	if loadedPRs[0].DisplayRepo() == "" {
+		t.Errorf("expected non-empty DisplayRepo()")
+	}
+
+	// Test DeletePullRequest with repo full name
+	if err := db.DeletePullRequest("client-co/api-gateway", 101); err != nil {
+		t.Fatalf("DeletePullRequest failed: %v", err)
+	}
+}
+
+func TestMultiOrgTasksAndHomeRepo(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	now := time.Now()
+	t1 := github.Task{
+		ID:         1001,
+		Number:     1,
+		Title:      "Central Home Task",
+		RepoOwner:  "acme-corp",
+		RepoName:   "grubby-tasks",
+		IsHomeRepo: true,
+		State:      "open",
+		Priority:   github.PriorityHigh,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+
+	t2 := github.Task{
+		ID:         1002,
+		Number:     5,
+		Title:      "Secondary Org Review Task",
+		RepoOwner:  "client-co",
+		RepoName:   "payments",
+		IsHomeRepo: false,
+		State:      "open",
+		Priority:   github.PriorityMedium,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+
+	if err := db.SaveTask(&t1, "synced"); err != nil {
+		t.Fatalf("SaveTask t1 failed: %v", err)
+	}
+	if err := db.SaveTask(&t2, "synced"); err != nil {
+		t.Fatalf("SaveTask t2 failed: %v", err)
+	}
+
+	tasks, err := db.GetTasks(false, "open")
+	if err != nil {
+		t.Fatalf("GetTasks failed: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+
+	for _, tk := range tasks {
+		if tk.ID == 1001 && !tk.IsHomeRepo {
+			t.Errorf("expected task 1001 to have IsHomeRepo=true")
+		}
+		if tk.ID == 1002 && tk.IsHomeRepo {
+			t.Errorf("expected task 1002 to have IsHomeRepo=false")
+		}
+	}
+}
+
+func TestOrganizationsCRUD(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	now := time.Now()
+	orgs := []github.Organization{
+		{
+			Login:        "acme-corp",
+			IsHome:       true,
+			Name:         "Acme Corporation",
+			AvatarURL:    "https://avatars.githubusercontent.com/u/100",
+			LastSyncedAt: now,
+		},
+		{
+			Login:        "client-co",
+			IsHome:       false,
+			Name:         "Client Systems",
+			AvatarURL:    "https://avatars.githubusercontent.com/u/200",
+			LastSyncedAt: now,
+		},
+	}
+
+	if err := db.SaveOrganizations(orgs); err != nil {
+		t.Fatalf("SaveOrganizations failed: %v", err)
+	}
+
+	loaded, err := db.GetOrganizations()
+	if err != nil {
+		t.Fatalf("GetOrganizations failed: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("expected 2 orgs, got %d", len(loaded))
+	}
+
+	home, err := db.GetHomeOrganization()
+	if err != nil || home == nil {
+		t.Fatalf("GetHomeOrganization failed: %v", err)
+	}
+	if home.Login != "acme-corp" {
+		t.Errorf("expected home org to be acme-corp, got %s", home.Login)
+	}
+
+	// Switch Home Org to client-co
+	if err := db.SetHomeOrganization("client-co"); err != nil {
+		t.Fatalf("SetHomeOrganization failed: %v", err)
+	}
+
+	newHome, _ := db.GetHomeOrganization()
+	if newHome == nil || newHome.Login != "client-co" {
+		t.Errorf("expected home org to be client-co, got %+v", newHome)
+	}
+
+	// Delete organization
+	if err := db.DeleteOrganization("acme-corp"); err != nil {
+		t.Fatalf("DeleteOrganization failed: %v", err)
+	}
+	remaining, _ := db.GetOrganizations()
+	if len(remaining) != 1 {
+		t.Fatalf("expected 1 remaining org, got %d", len(remaining))
+	}
+}
+
+func TestWebhookProcessedEventsDeduplication(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	deliveryID := "7b2e3c84-1234-5678-abcd-ef0123456789"
+	eventType := "pull_request"
+
+	// First time: should record and return true
+	inserted, err := db.RecordProcessedEvent(deliveryID, eventType)
+	if err != nil {
+		t.Fatalf("RecordProcessedEvent failed: %v", err)
+	}
+	if !inserted {
+		t.Errorf("expected first event to be recorded (true), got false")
+	}
+
+	// Second time with identical delivery ID: should return false (deduplicated!)
+	duplicate, err := db.RecordProcessedEvent(deliveryID, eventType)
+	if err != nil {
+		t.Fatalf("RecordProcessedEvent duplicate failed: %v", err)
+	}
+	if duplicate {
+		t.Errorf("expected duplicate event to return false, got true")
+	}
+
+	// IsEventProcessed check
+	processed, err := db.IsEventProcessed(deliveryID)
+	if err != nil || !processed {
+		t.Errorf("expected IsEventProcessed to return true, got %v (err: %v)", processed, err)
+	}
+
+	// Prune events
+	pruned, err := db.PruneProcessedEvents(1 * time.Hour)
+	if err != nil {
+		t.Fatalf("PruneProcessedEvents failed: %v", err)
+	}
+	if pruned != 0 {
+		t.Errorf("expected 0 events pruned (created just now), got %d", pruned)
+	}
+}
+
+func TestPruneRepositoriesForOrgs(t *testing.T) {
+	db := setupTestDB(t)
+
+	now := time.Now()
+	repos := []github.Repository{
+		{
+			Name:      "repo-1",
+			FullName:  "org-a/repo-1",
+			Owner:     "org-a",
+			PushedAt:  now,
+			UpdatedAt: now,
+		},
+		{
+			Name:      "repo-2",
+			FullName:  "org-a/repo-2",
+			Owner:     "org-a",
+			PushedAt:  now,
+			UpdatedAt: now,
+		},
+		{
+			Name:      "repo-3",
+			FullName:  "org-b/repo-3",
+			Owner:     "org-b",
+			PushedAt:  now,
+			UpdatedAt: now,
+		},
+	}
+
+	if err := db.SaveRepositories(repos, ""); err != nil {
+		t.Fatalf("SaveRepositories failed: %v", err)
+	}
+
+	// Insert a corrupt row where full_name does not match owner/name
+	_, err := db.db.Exec(`
+		INSERT INTO repositories (full_name, name, owner, description, pushed_at, updated_at, default_branch)
+		VALUES ('corrupt-org/repo-1', 'repo-1', 'other-org', '', ?, ?, 'main')
+	`, now.Format(time.RFC3339), now.Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("failed to insert corrupt repo: %v", err)
+	}
+
+	// Prune org-a, keeping only repo-1
+	err = db.PruneRepositoriesForOrgs([]string{"org-a"}, []string{"org-a/repo-1"})
+	if err != nil {
+		t.Fatalf("PruneRepositoriesForOrgs failed: %v", err)
+	}
+
+	loaded, err := db.GetRepositories()
+	if err != nil {
+		t.Fatalf("GetRepositories failed: %v", err)
+	}
+
+	// Should have repo-1 (org-a) and repo-3 (org-b). Corrupt row and repo-2 must be gone!
+	if len(loaded) != 2 {
+		t.Fatalf("expected 2 repositories after prune, got %d: %+v", len(loaded), loaded)
+	}
+	for _, r := range loaded {
+		if r.FullName == "org-a/repo-2" {
+			t.Errorf("expected org-a/repo-2 to be pruned")
+		}
+		if r.FullName == "corrupt-org/repo-1" {
+			t.Errorf("expected corrupt-org/repo-1 to be purged")
+		}
+	}
+}
+
 
 

@@ -445,7 +445,7 @@ func (c *Client) FetchRepositoriesAndPRs(ctx context.Context, owner string) ([]R
 	repoQueryWithAlerts := `
 query($login: String!, $cursor: String) {
   repositoryOwner(login: $login) {
-    repositories(first: 50, after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}) {
+    repositories(first: 50, after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}, ownerAffiliations: [OWNER]) {
       pageInfo {
         hasNextPage
         endCursor
@@ -453,6 +453,10 @@ query($login: String!, $cursor: String) {
       nodes {
         databaseId
         name
+        nameWithOwner
+        owner {
+          login
+        }
         description
         pushedAt
         updatedAt
@@ -498,6 +502,10 @@ query($login: String!, $cursor: String) {
 	type repoNode struct {
 		DatabaseID       *int64    `json:"databaseId"`
 		Name             string    `json:"name"`
+		NameWithOwner    string    `json:"nameWithOwner"`
+		Owner            struct {
+			Login string `json:"login"`
+		} `json:"owner"`
 		Description      *string   `json:"description"`
 		PushedAt         time.Time `json:"pushedAt"`
 		UpdatedAt        time.Time `json:"updatedAt"`
@@ -543,7 +551,7 @@ query($login: String!, $cursor: String) {
 	repoQueryFallback := `
 query($login: String!, $cursor: String) {
   repositoryOwner(login: $login) {
-    repositories(first: 50, after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}) {
+    repositories(first: 50, after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}, ownerAffiliations: [OWNER]) {
       pageInfo {
         hasNextPage
         endCursor
@@ -551,6 +559,10 @@ query($login: String!, $cursor: String) {
       nodes {
         databaseId
         name
+        nameWithOwner
+        owner {
+          login
+        }
         description
         pushedAt
         updatedAt
@@ -662,10 +674,25 @@ query($login: String!, $cursor: String) {
 			repoID = *node.DatabaseID
 		}
 
+		realOwner := node.Owner.Login
+		if realOwner == "" {
+			realOwner = owner
+		}
+		realFullName := node.NameWithOwner
+		if realFullName == "" {
+			realFullName = realOwner + "/" + node.Name
+		}
+
+		// Only include repositories that actually belong to the requested owner
+		if !strings.EqualFold(realOwner, owner) {
+			continue
+		}
+
 		repo := Repository{
 			ID:            repoID,
 			Name:          node.Name,
-			FullName:      owner + "/" + node.Name,
+			FullName:      realFullName,
+			Owner:         realOwner,
 			Description:   desc,
 			PushedAt:      node.PushedAt,
 			UpdatedAt:     node.UpdatedAt,
@@ -751,6 +778,10 @@ query($searchQuery: String!, $cursor: String) {
         title
         repository {
           name
+          nameWithOwner
+          owner {
+            login
+          }
         }
         author {
           login
@@ -784,7 +815,11 @@ query($searchQuery: String!, $cursor: String) {
 		Number     int    `json:"number"`
 		Title      string `json:"title"`
 		Repository struct {
-			Name string `json:"name"`
+			Name          string `json:"name"`
+			NameWithOwner string `json:"nameWithOwner"`
+			Owner         struct {
+				Login string `json:"login"`
+			} `json:"owner"`
 		} `json:"repository"`
 		Author *struct {
 			Login string `json:"login"`
@@ -864,9 +899,21 @@ query($searchQuery: String!, $cursor: String) {
 						}
 					}
 
+					prOwner := p.Repository.Owner.Login
+					prFullName := p.Repository.NameWithOwner
+					if prFullName == "" {
+						if prOwner != "" {
+							prFullName = prOwner + "/" + p.Repository.Name
+						} else {
+							prFullName = p.Repository.Name
+						}
+					}
+
 					prs = append(prs, PullRequest{
 						Number:             p.Number,
 						Repo:               p.Repository.Name,
+						RepoOwner:          prOwner,
+						RepoFullName:       prFullName,
 						Title:              p.Title,
 						Author:             author,
 						CreatedAt:          p.CreatedAt,
@@ -907,6 +954,10 @@ query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     databaseId
     name
+    nameWithOwner
+    owner {
+      login
+    }
     description
     pushedAt
     updatedAt
@@ -951,6 +1002,10 @@ query($owner: String!, $name: String!) {
 		Repository *struct {
 			DatabaseID       *int64    `json:"databaseId"`
 			Name             string    `json:"name"`
+			NameWithOwner    string    `json:"nameWithOwner"`
+			Owner            struct {
+				Login string `json:"login"`
+			} `json:"owner"`
 			Description      *string   `json:"description"`
 			PushedAt         time.Time `json:"pushedAt"`
 			UpdatedAt        time.Time `json:"updatedAt"`
@@ -1009,10 +1064,20 @@ query($owner: String!, $name: String!) {
 		repoID = *node.DatabaseID
 	}
 
+	realOwner := node.Owner.Login
+	if realOwner == "" {
+		realOwner = cleanOwner
+	}
+	realFullName := node.NameWithOwner
+	if realFullName == "" {
+		realFullName = realOwner + "/" + node.Name
+	}
+
 	repo := &Repository{
 		ID:            repoID,
 		Name:          node.Name,
-		FullName:      cleanOwner + "/" + node.Name,
+		FullName:      realFullName,
+		Owner:         realOwner,
 		Description:   desc,
 		PushedAt:      node.PushedAt,
 		UpdatedAt:     node.UpdatedAt,
