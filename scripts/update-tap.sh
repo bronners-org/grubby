@@ -18,7 +18,7 @@ if [ -z "${TAG}" ]; then
 fi
 
 echo "=================================================="
-echo " Syncing Homebrew Tap: simonbronner/homebrew-tap"
+echo " Syncing Homebrew Tap: bronners-org/homebrew-tap"
 echo " Target Tag: ${TAG}"
 echo "=================================================="
 
@@ -47,8 +47,8 @@ fi
 TAP_DIR=$(mktemp -d)
 trap 'rm -rf "${TAP_DIR}" "${TEMP_FETCH_DIR}"' EXIT
 
-echo "--> Cloning simonbronner/homebrew-tap..."
-git clone https://github.com/simonbronner/homebrew-tap.git "${TAP_DIR}"
+echo "--> Cloning bronners-org/homebrew-tap..."
+git clone https://github.com/bronners-org/homebrew-tap.git "${TAP_DIR}"
 
 mkdir -p "${TAP_DIR}/Formula"
 cp "${FORMULA_SOURCE}" "${TAP_DIR}/Formula/grubby.rb"
@@ -62,11 +62,11 @@ else
   git commit -m "chore(release): bump grubby to ${TAG}"
   echo "--> Pushing updated formula to origin/main..."
   git push origin main
-  echo "✓ simonbronner/homebrew-tap updated successfully to ${TAG}!"
+  echo "✓ bronners-org/homebrew-tap updated successfully to ${TAG}!"
 fi
 
 echo "=================================================="
 echo " You can test the formula locally with:"
 echo "   brew update"
-echo "   brew info simonbronner/tap/grubby"
+echo "   brew info bronners-org/tap/grubby"
 echo "=================================================="

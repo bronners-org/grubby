@@ -85,26 +85,26 @@ echo "--> Generating Homebrew Formula..."
 cat <<EOF > "${DIST_DIR}/grubby.rb"
 class Grubby < Formula
   desc "Terminal cockpit TUI for GitHub repositories, PRs, and workspaces"
-  homepage "https://github.com/simonbronner/grubby"
+  homepage "https://github.com/bronners-org/grubby"
   version "${VERSION}"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/simonbronner/grubby/releases/download/${TAG}/grubby_${TAG}_darwin_arm64.tar.gz"
+      url "https://github.com/bronners-org/grubby/releases/download/${TAG}/grubby_${TAG}_darwin_arm64.tar.gz"
       sha256 "${DARWIN_ARM64_SHA}"
     else
-      url "https://github.com/simonbronner/grubby/releases/download/${TAG}/grubby_${TAG}_darwin_amd64.tar.gz"
+      url "https://github.com/bronners-org/grubby/releases/download/${TAG}/grubby_${TAG}_darwin_amd64.tar.gz"
       sha256 "${DARWIN_AMD64_SHA}"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/simonbronner/grubby/releases/download/${TAG}/grubby_${TAG}_linux_arm64.tar.gz"
+      url "https://github.com/bronners-org/grubby/releases/download/${TAG}/grubby_${TAG}_linux_arm64.tar.gz"
       sha256 "${LINUX_ARM64_SHA}"
     else
-      url "https://github.com/simonbronner/grubby/releases/download/${TAG}/grubby_${TAG}_linux_amd64.tar.gz"
+      url "https://github.com/bronners-org/grubby/releases/download/${TAG}/grubby_${TAG}_linux_amd64.tar.gz"
       sha256 "${LINUX_AMD64_SHA}"
     end
   end
