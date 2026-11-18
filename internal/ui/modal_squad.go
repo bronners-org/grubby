@@ -524,7 +524,7 @@ func (m Model) renderHelpModal() string {
 
 	helpText := `
 Global Navigation:
-  [1-7] / [Tab]       Switch between primary tabs
+  [1-5] / [Tab]       Switch between primary tabs
   [r]                 Refresh data from GitHub & GitHub Status
   [?]                 Toggle this help dialog
   [q] / [Ctrl+C]      Quit
@@ -532,6 +532,8 @@ Global Navigation:
 Repositories Tab (1):
   [j/k] or [↑/↓]      Select repository, PR, or tier header
   [Space / Enter]     Toggle PR expansion (on repo) / Open PR (on PR row) / Toggle tier (on header)
+  [s]                 Open / switch dedicated session for selected repo
+  [S]                 Sort leader: [v] Vulnerabilities, [p] Pull requests, [l] Last updated
   [f]                 Filter leader: [n] Name, [l] Label, [s] Squad filter toggle
   [o]                 Open leader: [w/c] Web, [e] Editor, [s] Session, [p] PRs, [i] Issues, [a] Actions, [d] Security, [r] Releases, [n] Pulse
   [y]                 Yank leader: [w/c] Web URL, [s] Session, [p] PRs URL, [i] Issues URL, [a] Actions URL, [d] Security URL, [r] Releases URL
@@ -543,42 +545,30 @@ Repositories Tab (1):
   [l / Right / ]]     Expand PRs or tier
   [Esc]               Clear active filters / Cancel leader mode
 
-Pull Requests Tab (2):
-  [j/k] or [↑/↓]      Select pull request
+  When a Pull Request row is selected:
   [m]                 Merge approved pull request directly
-  [t]                 Request review from squad or squad member
-  [y]                 Yank PR URL to clipboard
-  [f]                 Filter PRs by title, repo, or author
-  [o]                 Open PR in browser
   [p]                 Trigger GitHub Copilot PR review
-  [c]                 Checkout PR branch in local workspace
+  [k] or [c]          Checkout PR branch in local workspace
+  [s]                 Open / switch session for parent repo
+  [t]                 Request review from squad or squad member (create task)
+  [Enter / o]         Open PR in browser
+  [y]                 Yank PR URL to clipboard
 
-My Tasks Tab (3):
+Tasks Tab (2):
   [j/k] or [↑/↓]      Select task
-  [a]                 Add new personal task inline
+  [a]                 Add task leader: [s] Squad Task, [m] My Task
+  [g]                 Go to task leader: [f] First, [l] Last, [number] Jump to task
   [Enter]             Edit task title (or Open PR directly if PR review task)
   [o]                 Open in browser (PR if review task, issue otherwise)
   [i]                 Always open underlying GitHub issue in browser
   [Space]             Toggle completed / active
+  [D]                 Toggle completed tasks section expand / collapse
+  [d]                 Show all completed tasks modal
   [n]                 View / edit notes
   [p]                 Cycle priority (High / Medium / Low)
-  [c]                 Cycle assignee
-  [d]                 Show all completed tasks modal
+  [c / A]             Assign task to squad members
 
-Squad Tasks Tab (4):
-  [j/k] or [↑/↓]      Select task
-  [a]                 Add new squad task inline
-  [Enter]             Edit task title (or Open PR directly if PR review task)
-  [o]                 Open in browser (PR if review task, issue otherwise)
-  [i]                 Always open underlying GitHub issue in browser
-  [Space]             Toggle completed / active
-  [A]                 Assign task to multiple squad members
-  [n]                 View / edit notes
-  [p]                 Cycle priority (High / Medium / Low)
-  [c]                 Cycle assignee
-  [d]                 Show all completed tasks modal
-
-Squad Activity Tab (5):
+Squad Activity Tab (3):
   [m]                 Manage squad (add/delete multiple members, rename, delete squad)
   [s]                 Switch watched squad
   [n]                 Create new squad
@@ -586,14 +576,14 @@ Squad Activity Tab (5):
   [d]                 Remove members from squad
   [o]                 Open event target in browser
 
-Code Search Tab (6):
+Code Search Tab (4):
   [/]                 Focus search query input
   [j/k] or [↑/↓]      Navigate results tree
   [h/l] or [Space]    Expand / Collapse repo or file branch
   [Tab]               Toggle focus between Tree and Code Preview
   [Enter]             Open match in $EDITOR at exact line number
 
-GitHub Status Tab (7):
+GitHub Status Tab (5):
   [j/k] or [↑/↓]      Select service component
   [o] / [Enter]       Open githubstatus.com in browser
   [r]                 Refresh GitHub status now
