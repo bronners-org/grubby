@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"grubby/internal/config"
 	"grubby/internal/git"
@@ -592,7 +593,7 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.fetchSingleRepoCmd(m.CurrentOrg, repo.Name),
 				)
 			case "e":
-				st := m.GitStatuses[repo.Name]
+				st := m.getGitStatus(repo.Name)
 				if st.IsCloned {
 					msgStr, err := OpenRepoEditor(repo.Name, st.LocalPath)
 					if err != nil {
@@ -605,7 +606,7 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				return m.startCloneWithAction(*repo, RepoActionEditor)
 			case "s":
-				st := m.GitStatuses[repo.Name]
+				st := m.getGitStatus(repo.Name)
 				if st.IsCloned {
 					msgStr, err := GoToRepoSession(repo.Name, st.LocalPath)
 					if err != nil {
@@ -868,6 +869,8 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, func() tea.Msg { return StatusToastMsg("Collapsed all repository tiers") }
 		case "s":
 			return m, func() tea.Msg { return StatusToastMsg("Select a repository to open session") }
+		case "r", "R":
+			return m, func() tea.Msg { return StatusToastMsg("Select a repository to refresh") }
 		default:
 			return m, nil
 		}
@@ -956,7 +959,7 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "k", "c":
 			// Checkout PR branch locally
 			if parentRepo != nil {
-				st := m.GitStatuses[parentRepo.Name]
+				st := m.getGitStatus(parentRepo.Name)
 				if !st.IsCloned {
 					return m, func() tea.Msg { return StatusToastMsg("Repo " + parentRepo.Name + " is not cloned yet!") }
 				}
@@ -974,7 +977,7 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "s":
 			// Top-level [s]ession for parent repo
 			if parentRepo != nil {
-				st := m.GitStatuses[parentRepo.Name]
+				st := m.getGitStatus(parentRepo.Name)
 				if st.IsCloned {
 					msgStr, err := GoToRepoSession(parentRepo.Name, st.LocalPath)
 					if err != nil {
@@ -988,6 +991,22 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.startCloneWithAction(*parentRepo, RepoActionSession)
 			}
 			return m, nil
+		case "r", "R":
+			// Refresh parent repository state directly via direct query
+			if parentRepo != nil {
+				owner := parentRepo.Owner
+				if owner == "" {
+					owner = m.CurrentOrg
+				}
+				m.StatusMsg = fmt.Sprintf("Refreshing %s directly from GitHub...", parentRepo.Name)
+				m.StatusMsgTimer = time.Now().Add(5 * time.Second)
+				return m, tea.Batch(
+					m.fetchSingleRepoCmd(owner, parentRepo.Name),
+					m.scanWorkspacesCmd([]string{parentRepo.Name}),
+					m.Spinner.Tick,
+				)
+			}
+			return m, nil
 		default:
 			return m, nil
 		}
@@ -997,9 +1016,22 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	repo := *currentItem.Repo
 
 	switch msg.String() {
+	case "r", "R":
+		// Refresh selected repository state directly via direct query
+		owner := repo.Owner
+		if owner == "" {
+			owner = m.CurrentOrg
+		}
+		m.StatusMsg = fmt.Sprintf("Refreshing %s directly from GitHub...", repo.Name)
+		m.StatusMsgTimer = time.Now().Add(5 * time.Second)
+		return m, tea.Batch(
+			m.fetchSingleRepoCmd(owner, repo.Name),
+			m.scanWorkspacesCmd([]string{repo.Name}),
+			m.Spinner.Tick,
+		)
 	case "s":
 		// Top-level [s]ession command
-		st := m.GitStatuses[repo.Name]
+		st := m.getGitStatus(repo.Name)
 		if st.IsCloned {
 			msgStr, err := GoToRepoSession(repo.Name, st.LocalPath)
 			if err != nil {
@@ -1039,6 +1071,17 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if newHidden {
 			m.HiddenRepos[strings.ToLower(repo.Name)] = true
+			if len(m.Notifications) > 0 {
+				var remainingNotifs []github.Notification
+				for _, n := range m.Notifications {
+					if !strings.EqualFold(n.Repository, repo.Name) &&
+						!strings.EqualFold(n.Repository, repo.FullName) &&
+						!m.isRepoHidden(n.Repository) {
+						remainingNotifs = append(remainingNotifs, n)
+					}
+				}
+				m.Notifications = remainingNotifs
+			}
 		} else {
 			delete(m.HiddenRepos, strings.ToLower(repo.Name))
 		}
@@ -1112,7 +1155,7 @@ func (m Model) handleReposKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// 'c' clone repo
 		m = m.recordRepoInteraction(repo.Name)
 		m = m.focusRepoCursor(repo.Name)
-		st := m.GitStatuses[repo.Name]
+		st := m.getGitStatus(repo.Name)
 		if st.IsCloned {
 			return m, func() tea.Msg { return StatusToastMsg(repo.Name + " is already cloned!") }
 		}
@@ -1217,10 +1260,8 @@ func (m Model) renderReposView() string {
 	headerRow := lipgloss.JoinHorizontal(lipgloss.Top,
 		cols.Cursor.Render(""),
 		cols.Name.Render("REPOSITORY & LABELS"),
-		cols.Summary.Render("(Vulns - PRs - Issues)"),
+		cols.Summary.Render("(Vulns - Issues)"),
 		cols.Git.Render("GIT STATUS"),
-		cols.Session.Render("TMUX"),
-		cols.Last.Render("LAST PUSHED"),
 		cols.Path.Render("LOCAL PATH"),
 	)
 	renderedHeader := TableHeaderStyle.Render(headerRow)
@@ -1314,11 +1355,6 @@ func (m Model) renderReposView() string {
 	totalW := m.Width - 4
 	if totalW < 80 {
 		totalW = 80
-	}
-
-	prCountByRepo := make(map[string]int, len(m.PRs))
-	for _, pr := range m.PRs {
-		prCountByRepo[strings.ToLower(github.NormalizeRepoName(pr.Repo))]++
 	}
 
 	taskCountByRepo := make(map[string]int, len(m.PersonalTasks)+len(m.SquadTasks))
@@ -1438,22 +1474,12 @@ func (m Model) renderReposView() string {
 			if pr.IsDraft {
 				authorText += " (draft)"
 			}
-			if len(authorText) > cols.GitWidth-2 && cols.GitWidth > 3 {
-				authorText = authorText[:cols.GitWidth-3] + "…"
+			if runewidth.StringWidth(authorText) > cols.GitWidth-2 && cols.GitWidth > 3 {
+				authorText = runewidth.Truncate(authorText, cols.GitWidth-3, "…")
 			}
 			gitColText := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(authorText)
 
-			// Session column: Branch
-			branchText := "-"
-			if pr.HeadRefName != "" {
-				branchText = "⑂ " + pr.HeadRefName
-				if len(branchText) > cols.SessionWidth-2 && cols.SessionWidth > 3 {
-					branchText = branchText[:cols.SessionWidth-3] + "…"
-				}
-			}
-			sessionColText := lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(branchText)
-
-			// Last column: Age
+			// Path column: [Age] ⑂ Branch  Labels/URL
 			var rawAge string
 			if pr.CreatedAt.IsZero() {
 				rawAge = "-"
@@ -1462,24 +1488,35 @@ func (m Model) renderReposView() string {
 			} else {
 				rawAge = formatTimeAgo(pr.CreatedAt)
 			}
-			var lastColText string
+			ageText := fmt.Sprintf("[%s]", rawAge)
+			var styledAge string
 			if pr.DaysStale() >= 3 && !pr.CreatedAt.IsZero() {
-				lastColText = StaleBadge.Render(rawAge)
+				styledAge = StaleBadge.Render(ageText)
 			} else {
-				lastColText = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(rawAge)
+				styledAge = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(ageText)
 			}
 
-			// Path column: Labels or URL
-			pathText := "-"
+			var prDetails []string
+			if pr.HeadRefName != "" {
+				prDetails = append(prDetails, "⑂ "+pr.HeadRefName)
+			}
 			if len(pr.Labels) > 0 {
-				pathText = strings.Join(pr.Labels, ", ")
+				prDetails = append(prDetails, strings.Join(pr.Labels, ", "))
 			} else if pr.URL != "" {
-				pathText = pr.URL
+				prDetails = append(prDetails, pr.URL)
 			}
-			if len(pathText) > cols.PathWidth-2 && cols.PathWidth > 3 {
-				pathText = pathText[:cols.PathWidth-3] + "…"
+			extraText := strings.Join(prDetails, "  ")
+
+			availExtra := cols.PathWidth - runewidth.StringWidth(ageText) - 1
+			var pathColText string
+			if availExtra > 0 && extraText != "" {
+				if runewidth.StringWidth(extraText) > availExtra {
+					extraText = runewidth.Truncate(extraText, availExtra, "…")
+				}
+				pathColText = styledAge + " " + lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(extraText)
+			} else {
+				pathColText = styledAge
 			}
-			pathColText := lipgloss.NewStyle().Foreground(lipgloss.Color("#555566")).Render(pathText)
 
 			isFlashing, flashBg := m.isEntityFlashing(fmt.Sprintf("pr:%s#%d", pr.DisplayRepo(), pr.Number))
 			if !isFlashing {
@@ -1498,8 +1535,6 @@ func (m Model) renderReposView() string {
 				cols.Name.Render(nameColText),
 				cols.Summary.Render(summaryColText),
 				cols.Git.Render(gitColText),
-				cols.Session.Render(sessionColText),
-				cols.Last.Render(lastColText),
 				cols.Path.Render(pathColText),
 			)
 
@@ -1519,11 +1554,10 @@ func (m Model) renderReposView() string {
 
 		// Repo row
 		r := *item.Repo
-		st := m.GitStatuses[r.Name]
+		st := m.getGitStatus(r.Name)
 		isDead := item.Tier == storage.TierDead || item.Tier == storage.TierHidden
 
 		rNorm := strings.ToLower(github.NormalizeRepoName(r.Name))
-		prCount := prCountByRepo[rNorm]
 		taskCount := taskCountByRepo[rNorm]
 
 		// Name & Labels formatting
@@ -1616,7 +1650,7 @@ func (m Model) renderReposView() string {
 			}
 		}
 
-		// 3. (Vulns - PRs - Issues) column: ( 0 0 0 ) / ( 1 2 3 ) - ( prCount ) - ( taskCount )
+		// 3. (Vulns - Issues) column: ( 0 0 0 ) / ( 1 2 3 ) - ( taskCount )
 		var vulnText string
 		sum := m.SecuritySummaries[r.Name]
 		if isDead {
@@ -1652,15 +1686,6 @@ func (m Model) renderReposView() string {
 			}
 		}
 
-		var prBadge string
-		if isDead {
-			prBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(fmt.Sprintf("( %d )", prCount))
-		} else if prCount > 0 {
-			prBadge = "( " + lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(fmt.Sprintf("%d", prCount)) + " )"
-		} else {
-			prBadge = lipgloss.NewStyle().Foreground(MutedColor).Render("( 0 )")
-		}
-
 		var taskBadge string
 		if isDead {
 			taskBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(fmt.Sprintf("( %d )", taskCount))
@@ -1670,10 +1695,14 @@ func (m Model) renderReposView() string {
 			taskBadge = lipgloss.NewStyle().Foreground(MutedColor).Render("( 0 )")
 		}
 
-		summaryColText := fmt.Sprintf("%s - %s - %s", vulnText, prBadge, taskBadge)
+		summaryColText := fmt.Sprintf("%s - %s", vulnText, taskBadge)
 
 		// 4. Git badge
-		gitBadge := st.Badge()
+		gitW := cols.GitWidth
+		if gitW > 4 {
+			gitW = cols.GitWidth - 2
+		}
+		gitBadge := st.ShortBadge(gitW)
 		var styledBadge string
 		if isDead {
 			styledBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(gitBadge)
@@ -1683,8 +1712,14 @@ func (m Model) renderReposView() string {
 				styledBadge = SyncedBadge.Render(gitBadge)
 			case git.StateBehind:
 				styledBadge = BehindBadge.Render(gitBadge)
+			case git.StateAhead:
+				styledBadge = lipgloss.NewStyle().Foreground(HighlightColor).Bold(true).Render(gitBadge)
+			case git.StateDiverged:
+				styledBadge = lipgloss.NewStyle().Foreground(WarningColor).Bold(true).Render(gitBadge)
 			case git.StateDirty:
 				styledBadge = DirtyBadge.Render(gitBadge)
+			case git.StateNoUpstream:
+				styledBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(gitBadge)
 			case git.StateNotCloned:
 				styledBadge = NotClonedBadge.Render(gitBadge)
 			default:
@@ -1692,38 +1727,75 @@ func (m Model) renderReposView() string {
 			}
 		}
 
-		// 5. TMUX session
-		var sessionColText string
+		// 5. Local path (with [last pushed] prefix and optional (tmux: N) suffix)
+		rawTime := formatTimeAgo(r.LastUpdated())
+		timeBadgeText := fmt.Sprintf("[%s]", rawTime)
+		if rawTime == "-" {
+			timeBadgeText = "[-]"
+		}
+
+		var styledTime string
+		if isDead {
+			styledTime = lipgloss.NewStyle().Foreground(lipgloss.Color("#505565")).Render(timeBadgeText)
+		} else {
+			styledTime = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(timeBadgeText)
+		}
+		timeW := runewidth.StringWidth(timeBadgeText)
+
+		// Check for active tmux session
+		var tmuxBadgeText string
+		var styledTmux string
+		var tmuxW int
 		if sess, ok := FindTmuxSession(r.Name, tmuxSessions); ok && sess.Windows > 0 {
-			plural := "win"
-			if sess.Windows > 1 {
-				plural = "wins"
-			}
+			tmuxBadgeText = fmt.Sprintf("(tmux: %d)", sess.Windows)
+			tmuxW = runewidth.StringWidth(tmuxBadgeText)
 			if isDead {
-				sessionColText = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(fmt.Sprintf("● %d %s", sess.Windows, plural))
+				styledTmux = lipgloss.NewStyle().Foreground(lipgloss.Color("#505565")).Render(tmuxBadgeText)
 			} else {
-				sessionColText = lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(fmt.Sprintf("● %d %s", sess.Windows, plural))
+				styledNum := lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render(fmt.Sprintf("%d", sess.Windows))
+				styledTmux = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render("(tmux: ") + styledNum + lipgloss.NewStyle().Foreground(lipgloss.Color("#7D8590")).Render(")")
+			}
+		}
+
+		rawPath := "-"
+		if st.IsCloned {
+			rawPath = config.CollapseHome(st.LocalPath)
+		}
+
+		// Calculate available width for path so (tmux: N) is guaranteed visible
+		reserved := timeW
+		if tmuxW > 0 {
+			reserved += 1 + tmuxW
+		}
+
+		availForPath := cols.PathWidth - reserved - 1 // 1 for space after time
+		truncatedPath := rawPath
+		if availForPath <= 0 {
+			truncatedPath = ""
+		} else if runewidth.StringWidth(rawPath) > availForPath {
+			truncatedPath = truncatePathLeft(rawPath, availForPath)
+		}
+
+		var styledPath string
+		if isDead {
+			styledPath = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(truncatedPath)
+		} else {
+			styledPath = lipgloss.NewStyle().Foreground(lipgloss.Color("#E0E0E0")).Render(truncatedPath)
+		}
+
+		var pathColText string
+		if truncatedPath != "" {
+			if tmuxW > 0 {
+				pathColText = styledTime + " " + styledPath + " " + styledTmux
+			} else {
+				pathColText = styledTime + " " + styledPath
 			}
 		} else {
-			sessionColText = lipgloss.NewStyle().Foreground(lipgloss.Color("#505565")).Render("○ none")
-		}
-
-		// 6. Last pushed
-		lastPushed := formatTimeAgo(r.LastUpdated())
-		if isDead {
-			lastPushed = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(lastPushed)
-		}
-
-		// 7. Local path
-		localPath := "-"
-		if st.IsCloned {
-			localPath = config.CollapseHome(st.LocalPath)
-			if len(localPath) > cols.PathWidth-2 && cols.PathWidth > 3 {
-				localPath = "…" + localPath[len(localPath)-(cols.PathWidth-3):]
+			if tmuxW > 0 {
+				pathColText = styledTime + " " + styledTmux
+			} else {
+				pathColText = styledTime
 			}
-		}
-		if isDead {
-			localPath = lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Render(localPath)
 		}
 
 		isFlashing, flashBg := m.isEntityFlashing("repo:" + r.FullName)
@@ -1743,9 +1815,7 @@ func (m Model) renderReposView() string {
 			cols.Name.Render(nameColText),
 			cols.Summary.Render(summaryColText),
 			cols.Git.Render(styledBadge),
-			cols.Session.Render(sessionColText),
-			cols.Last.Render(lastPushed),
-			cols.Path.Render(localPath),
+			cols.Path.Render(pathColText),
 		)
 
 		if i == m.RepoCursor {
@@ -1764,23 +1834,54 @@ func (m Model) renderReposView() string {
 	return strings.Join(rows, "\n")
 }
 
+func truncatePathLeft(p string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if runewidth.StringWidth(p) <= maxWidth {
+		return p
+	}
+	if maxWidth == 1 {
+		return "…"
+	}
+	runes := []rune(p)
+	tailWidth := maxWidth - 1
+	start := len(runes)
+	curW := 0
+	for start > 0 {
+		rw := runewidth.RuneWidth(runes[start-1])
+		if curW+rw > tailWidth {
+			break
+		}
+		curW += rw
+		start--
+	}
+	return "…" + string(runes[start:])
+}
+
 func formatTimeAgo(t time.Time) string {
 	if t.IsZero() {
 		return "-"
 	}
 	d := time.Since(t)
-	if d.Hours() < 1 {
-		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	if d < time.Minute {
+		return "just now"
 	}
-	if d.Hours() < 24 {
-		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(d.Hours()))
 	}
 	days := int(d.Hours() / 24)
-	if days == 1 {
-		return "yesterday"
+	if days < 7 {
+		return fmt.Sprintf("%dd", days)
 	}
 	if days < 30 {
-		return fmt.Sprintf("%dd ago", days)
+		return fmt.Sprintf("%dw", days/7)
 	}
-	return t.Format("02 Jan 2006")
+	if days < 365 {
+		return fmt.Sprintf("%dmo", days/30)
+	}
+	return fmt.Sprintf("%dy", days/365)
 }

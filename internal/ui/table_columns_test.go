@@ -10,16 +10,16 @@ func TestComputeRepoColumns(t *testing.T) {
 	for _, w := range widths {
 		cols := computeRepoColumns(w)
 
-		if cols.NameWidth <= 0 || cols.SummaryWidth <= 0 || cols.PathWidth <= 0 || cols.SessionWidth <= 0 {
+		if cols.NameWidth <= 0 || cols.SummaryWidth <= 0 || cols.PathWidth <= 0 || cols.GitWidth <= 0 {
 			t.Fatalf("Width %d produced invalid column width: %+v", w, cols)
 		}
 
 		target := w - 2
-		if target < 114 {
-			target = 114
+		if target < 90 {
+			target = 90
 		}
 
-		fixedWidth := 3 + 28 + 16 + 12 + 13 // 72
+		fixedWidth := 3 + 20 + 24 // 47
 		total := fixedWidth + cols.NameWidth + cols.PathWidth
 
 		if total != target {

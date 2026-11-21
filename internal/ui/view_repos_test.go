@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -268,19 +269,175 @@ func TestReposKeyHandling_FilterAndSortKeys(t *testing.T) {
 	}
 }
 
-func TestRenderReposView_TmuxSessionColumn(t *testing.T) {
+func TestRenderReposView_ColumnsOptimized(t *testing.T) {
 	m := createTestModel()
 	m.Width = 120
 	m.Height = 25
 
 	rendered := m.renderReposView()
 
-	// Verify TMUX column is present and BRANCH is dropped
-	if !strings.Contains(rendered, "TMUX") {
-		t.Errorf("expected rendered repos view to contain 'TMUX' header column, got:\n%s", rendered)
+	// Verify TMUX and LAST PUSHED columns are removed, LOCAL PATH is present
+	if strings.Contains(rendered, "TMUX") {
+		t.Errorf("expected rendered repos view to drop separate 'TMUX' header column, got:\n%s", rendered)
 	}
-	if strings.Contains(rendered, "BRANCH") {
-		t.Errorf("expected rendered repos view to drop 'BRANCH' column")
+	if strings.Contains(rendered, "LAST PUSHED") {
+		t.Errorf("expected rendered repos view to drop separate 'LAST PUSHED' header column, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "LOCAL PATH") {
+		t.Errorf("expected rendered repos view to contain 'LOCAL PATH' header column, got:\n%s", rendered)
+	}
+}
+
+func TestRenderReposView_LocalPathWithLastPushedAndTmux(t *testing.T) {
+	m := createTestModel()
+	m.Width = 160
+	m.Height = 30
+	now := time.Now()
+
+	m.Repos = []github.Repository{
+		{Name: "tasks", FullName: "bronners-org/tasks", PushedAt: now.Add(-5 * 24 * time.Hour)},
+		{Name: "web-client", FullName: "bronners-org/web-client", PushedAt: now.Add(-1 * 24 * time.Hour)},
+	}
+	m.GitStatuses = map[string]git.RepoGitStatus{
+		"tasks": {
+			RepoName:    "tasks",
+			LocalPath:   "/Users/test/workspaces/tasks",
+			IsCloned:    true,
+			Branch:      "main",
+			State:       git.StateSynced,
+			HasUpstream: true,
+		},
+		"web-client": {
+			RepoName:    "web-client",
+			LocalPath:   "/Users/test/workspaces/web-client",
+			IsCloned:    true,
+			Branch:      "main",
+			State:       git.StateSynced,
+			HasUpstream: true,
+		},
+	}
+	m.TmuxSessions = map[string]TmuxSessionInfo{
+		"tasks": {
+			Windows: 1,
+		},
+	}
+
+	rendered := m.renderReposView()
+
+	// Verify tasks row contains [5d] and (tmux: 1)
+	if !strings.Contains(rendered, "[5d]") {
+		t.Errorf("expected rendered view to contain '[5d]', got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "(tmux: 1)") {
+		t.Errorf("expected rendered view to contain '(tmux: 1)', got:\n%s", rendered)
+	}
+
+	// Verify web-client row contains [1d] and does NOT contain tmux indicator
+	if !strings.Contains(rendered, "[1d]") {
+		t.Errorf("expected rendered view to contain '[1d]', got:\n%s", rendered)
+	}
+}
+
+func TestFormatTimeAgo_CompactWithoutAgo(t *testing.T) {
+	now := time.Now()
+
+	cases := []struct {
+		name     string
+		t        time.Time
+		expected string
+	}{
+		{"zero", time.Time{}, "-"},
+		{"just now (30s)", now.Add(-30 * time.Second), "just now"},
+		{"minutes (1m)", now.Add(-1 * time.Minute), "1m"},
+		{"minutes (45m)", now.Add(-45 * time.Minute), "45m"},
+		{"hours (1h)", now.Add(-1 * time.Hour), "1h"},
+		{"hours (12h)", now.Add(-12 * time.Hour), "12h"},
+		{"days (1d)", now.Add(-24 * time.Hour), "1d"},
+		{"days (3d)", now.Add(-3 * 24 * time.Hour), "3d"},
+		{"weeks (2w)", now.Add(-14 * 24 * time.Hour), "2w"},
+		{"months (2mo)", now.Add(-60 * 24 * time.Hour), "2mo"},
+		{"years (1y)", now.Add(-400 * 24 * time.Hour), "1y"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatTimeAgo(tc.t)
+			if got != tc.expected {
+				t.Errorf("formatTimeAgo(%s) = %q, want %q", tc.name, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestRenderReposView_GitStatusRealEstateAndSeparation(t *testing.T) {
+	m := createTestModel()
+	m.Width = 120
+	m.Height = 25
+	now := time.Now()
+
+	m.Repos = []github.Repository{
+		{
+			Name:     "grubby",
+			FullName: "bronners-org/grubby",
+			PushedAt: now.Add(-3 * 24 * time.Hour),
+		},
+	}
+	m.GitStatuses = map[string]git.RepoGitStatus{
+		"grubby": {
+			RepoName:    "grubby",
+			LocalPath:   "/Users/test/workspaces/grubby",
+			IsCloned:    true,
+			Branch:      "hide-notifications-for-hidden",
+			IsDirty:     true,
+			State:       git.StateDirty,
+			HasUpstream: true,
+		},
+	}
+
+	rendered := m.renderReposView()
+
+	// Verify that the branch name has more real-estate than the old 16-col truncation ("* hide-notifica…")
+	// With GitWidth=24 (badge width 22), it shows "* hide-notifications-…"
+	if !strings.Contains(rendered, "* hide-notifications-…") {
+		t.Errorf("expected rendered view to show expanded git status '* hide-notifications-…', got:\n%s", rendered)
+	}
+
+	// Verify [3d] is present
+	if !strings.Contains(rendered, "[3d]") {
+		t.Errorf("expected rendered view to contain '[3d]', got:\n%s", rendered)
+	}
+
+	// Crucial check: Git status and [3d] MUST NOT directly touch each other
+	if strings.Contains(rendered, "…[3d]") {
+		t.Errorf("CRITICAL: git status and [3d] are colliding without whitespace separation, got:\n%s", rendered)
+	}
+}
+
+func TestRenderReposView_TmuxSessionAlwaysVisibleOnLongPath(t *testing.T) {
+	m := createTestModel()
+	m.Width = 90
+	m.Height = 25
+	now := time.Now()
+
+	m.Repos = []github.Repository{
+		{Name: "very-long-repo-name-service-backend", FullName: "org/very-long-repo-name-service-backend", PushedAt: now.Add(-2 * time.Hour)},
+	}
+	m.GitStatuses = map[string]git.RepoGitStatus{
+		"very-long-repo-name-service-backend": {
+			RepoName:  "very-long-repo-name-service-backend",
+			LocalPath: "/Users/test/workspaces/corporate-org/very-long-repo-name-service-backend",
+			IsCloned:  true,
+		},
+	}
+	m.TmuxSessions = map[string]TmuxSessionInfo{
+		"very-long-repo-name-service-backend": {
+			Windows: 2,
+		},
+	}
+
+	rendered := m.renderReposView()
+	if !strings.Contains(rendered, "(tmux: 2)") {
+		t.Errorf("expected '(tmux: 2)' to remain visible despite long path and constrained width, got:\n%s", rendered)
 	}
 }
 
@@ -791,9 +948,12 @@ func TestSummaryColumnAndInlineLabelsRendering(t *testing.T) {
 
 	view := m.renderReposView()
 
-	// 1. Verify column header is (Vulns - PRs - Issues)
-	if !strings.Contains(view, "(Vulns - PRs - Issues)") {
-		t.Errorf("expected '(Vulns - PRs - Issues)' column header, got:\n%s", view)
+	// 1. Verify column header is (Vulns - Issues)
+	if !strings.Contains(view, "(Vulns - Issues)") {
+		t.Errorf("expected '(Vulns - Issues)' column header, got:\n%s", view)
+	}
+	if strings.Contains(view, "(Vulns - PRs - Issues)") {
+		t.Errorf("expected '(Vulns - PRs - Issues)' to be updated to '(Vulns - Issues)', got:\n%s", view)
 	}
 
 	// 2. Verify inline labels #backend and #core are rendered
@@ -806,15 +966,20 @@ func TestSummaryColumnAndInlineLabelsRendering(t *testing.T) {
 		t.Errorf("expected repository About text in repo view, got:\n%s", view)
 	}
 
-	// 4. Verify (Vulns - PRs - Issues) format: ( 1 2 2 ) - ( 2 ) - ( 3 ) without commas
+	// 4. Verify (Vulns - Issues) format: ( 1 2 2 ) - ( 3 ) without PRs in this column
 	if !strings.Contains(view, "( 1 2 2 )") {
 		t.Errorf("expected '( 1 2 2 )' vulnerabilities without commas, got:\n%s", view)
 	}
-	if !strings.Contains(view, "( 2 )") {
-		t.Errorf("expected ( 2 ) PR count in column, got:\n%s", view)
-	}
 	if !strings.Contains(view, "( 3 )") {
 		t.Errorf("expected ( 3 ) task count in column, got:\n%s", view)
+	}
+	// Verify that the summary column does NOT contain the separate ( 2 ) PR badge between vulns and tasks
+	if strings.Contains(view, "( 1 2 2 ) - ( 2 ) - ( 3 )") {
+		t.Errorf("expected PR count to be removed from (Vulns - Issues) column, got:\n%s", view)
+	}
+	// Verify that PR count is shown in the REPOSITORY & LABELS column
+	if !strings.Contains(view, "[▶ 2 PRs]") {
+		t.Errorf("expected '[▶ 2 PRs]' in REPOSITORY & LABELS column, got:\n%s", view)
 	}
 
 	// 5. Test clean repo with 0 vulnerabilities renders green ( 0 0 0 ) without commas
@@ -1737,6 +1902,361 @@ func TestTopLevelTabs_WithoutPRTab(t *testing.T) {
 	m = updated.(Model)
 	if m.ActiveTab != TabRepos {
 		t.Errorf("expected TabRepos after cycling from 5, got %v", m.ActiveTab)
+	}
+}
+
+func TestRepositoryRefreshDirectQuery(t *testing.T) {
+	m := createTestModel()
+	m.ActiveTab = TabRepos
+
+	// 1. Footer contains [r] Refresh
+	m.RepoCursor = m.firstSelectableRepoIndex()
+	footer := m.renderFooter()
+	if !strings.Contains(footer, "[r] Refresh") {
+		t.Fatalf("expected footer to contain '[r] Refresh', got:\n%s", footer)
+	}
+
+	// 2. Press 'r' on repo row
+	selectedRepo := m.getSelectedRepo()
+	if selectedRepo == nil {
+		t.Fatalf("expected selected repo at index %d", m.RepoCursor)
+	}
+	updated, cmd := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("expected non-nil cmd on pressing 'r'")
+	}
+	expectedStatus := fmt.Sprintf("Refreshing %s directly from GitHub...", selectedRepo.Name)
+	if m.StatusMsg != expectedStatus {
+		t.Errorf("expected status %q, got %q", expectedStatus, m.StatusMsg)
+	}
+
+	// 3. Press 'R' (capital) on repo row
+	updated, cmd = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = updated.(Model)
+	if cmd == nil || m.StatusMsg != expectedStatus {
+		t.Errorf("expected 'R' to also trigger refresh, got status %q", m.StatusMsg)
+	}
+
+	// 4. Press 'r' on tier header
+	m.RepoCursor = 0 // Tier header
+	updated, cmd = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("expected toast cmd on pressing 'r' on tier header")
+	}
+	msg := cmd()
+	if toast, ok := msg.(StatusToastMsg); !ok || string(toast) != "Select a repository to refresh" {
+		t.Errorf("expected toast 'Select a repository to refresh', got %v", msg)
+	}
+
+	// 5. Press 'r' on PR row refreshes parent repo
+	pr := github.PullRequest{
+		Number:       10,
+		Repo:         selectedRepo.Name,
+		RepoFullName: selectedRepo.FullName,
+		Title:        "Test PR for refresh",
+		HeadRefName:  "feature/test",
+	}
+	m.PRs = []github.PullRequest{pr}
+	m.ExpandedRepoPRs = map[string]bool{strings.ToLower(selectedRepo.Name): true}
+	items := m.getRepoTableItems()
+	prIdx := -1
+	for idx, it := range items {
+		if it.Kind == ItemRepoPR {
+			prIdx = idx
+			break
+		}
+	}
+	if prIdx == -1 {
+		t.Fatalf("expected expanded PR row in repo table")
+	}
+	m.RepoCursor = prIdx
+	// Verify footer shows [r] Refresh on PR row too
+	prFooter := m.renderFooter()
+	if !strings.Contains(prFooter, "[r] Refresh") {
+		t.Errorf("expected PR footer to contain '[r] Refresh', got:\n%s", prFooter)
+	}
+
+	updated, cmd = m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+	if cmd == nil || m.StatusMsg != expectedStatus {
+		t.Errorf("expected 'r' on PR row to refresh parent repo %q, got status %q", selectedRepo.Name, m.StatusMsg)
+	}
+
+	// 6. Test SingleRepoLoadedMsg processing
+	now := time.Now()
+	newPR := github.PullRequest{
+		Number:       11,
+		Repo:         selectedRepo.Name,
+		RepoFullName: selectedRepo.FullName,
+		Title:        "Newly loaded PR via direct query",
+		ReviewDecision: "APPROVED",
+	}
+	loadedRepo := *selectedRepo
+	loadedRepo.PushedAt = now
+	loadedMsg := SingleRepoLoadedMsg{
+		Repo: &loadedRepo,
+		PRs:  []github.PullRequest{newPR},
+		Events: []github.SquadEvent{
+			{Actor: "alice", Action: "Committed", Repo: selectedRepo.Name, Details: "test commit", Timestamp: now},
+		},
+		Security: &github.SecurityAlertSummary{Repo: selectedRepo.Name, Total: 0},
+	}
+
+	updatedModel, _ := m.Update(loadedMsg)
+	m = updatedModel.(Model)
+	if !strings.Contains(m.StatusMsg, fmt.Sprintf("✓ Refreshed %s", selectedRepo.Name)) {
+		t.Errorf("expected success status message, got %q", m.StatusMsg)
+	}
+
+	// Verify PRs were updated with the direct query results
+	foundRefreshedPR := false
+	for _, p := range m.PRs {
+		if p.Number == 11 && strings.EqualFold(p.Repo, selectedRepo.Name) {
+			foundRefreshedPR = true
+			break
+		}
+	}
+	if !foundRefreshedPR {
+		t.Errorf("expected PR #11 to be in m.PRs after direct query refresh")
+	}
+
+	// 7. Test 'r' on TabRepos via top-level Update delegates to handleReposKeys instead of full loadDataCmd
+	m.RepoCursor = m.firstSelectableRepoIndex()
+	m.Loading = false
+	updatedTop, topCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	mTop := updatedTop.(Model)
+	if mTop.StatusMsg != expectedStatus {
+		t.Errorf("expected top-level 'r' on TabRepos to set single repo refresh status, got %q", mTop.StatusMsg)
+	}
+	if topCmd == nil {
+		t.Errorf("expected non-nil cmd from top-level 'r'")
+	}
+}
+
+func TestHiddenRepoNotificationSuppression(t *testing.T) {
+	m := createTestModel()
+	m.HiddenRepos = map[string]bool{
+		"auth-service": true,
+	}
+
+	// 1. DataLoadedMsg with notifications: auth-service (hidden) vs api-gateway (visible)
+	notifHidden := github.Notification{
+		ID:         "notif-1",
+		Repository: "corp/auth-service",
+		Title:      "PR in hidden auth-service",
+		Type:       "PullRequest",
+		Unread:     true,
+	}
+	notifVisible := github.Notification{
+		ID:         "notif-2",
+		Repository: "corp/api-gateway",
+		Title:      "PR in visible api-gateway",
+		Type:       "PullRequest",
+		Unread:     true,
+	}
+
+	dataMsg := DataLoadedMsg{
+		Notifications: []github.Notification{notifHidden, notifVisible},
+	}
+
+	updated, _ := m.Update(dataMsg)
+	m = updated.(Model)
+
+	// Verify hidden notification is NOT in m.Notifications
+	if len(m.Notifications) != 1 {
+		t.Fatalf("expected 1 active notification, got %d", len(m.Notifications))
+	}
+	if m.Notifications[0].ID != "notif-2" {
+		t.Errorf("expected visible notification 'notif-2', got %s", m.Notifications[0].ID)
+	}
+	// Verify hidden notification was marked in SeenNotificationIDs so it will never alert later
+	if !m.SeenNotificationIDs["notif-1"] {
+		t.Errorf("expected SeenNotificationIDs['notif-1'] to be true")
+	}
+
+	// 2. Toggling 'h' on a repository removes its notifications from m.Notifications
+	m.Notifications = []github.Notification{
+		{ID: "n-3", Repository: "api-gateway", Title: "Notice for api-gateway"},
+	}
+	m.CollapsedTiers = map[storage.RepoTier]bool{
+		storage.TierDead:   false,
+		storage.TierHidden: false,
+	}
+	// Cursor on api-gateway
+	items := m.getRepoTableItems()
+	for idx, it := range items {
+		if it.Kind == ItemRepo && it.Repo != nil && it.Repo.Name == "api-gateway" {
+			m.RepoCursor = idx
+			break
+		}
+	}
+	// Press 'h' to hide api-gateway
+	updatedH, _ := m.handleReposKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	mH := updatedH.(Model)
+	if !mH.isRepoHidden("api-gateway") {
+		t.Errorf("expected api-gateway to be hidden after 'h'")
+	}
+	if len(mH.Notifications) != 0 {
+		t.Errorf("expected notifications for api-gateway to be purged from m.Notifications, got %d", len(mH.Notifications))
+	}
+}
+
+func TestGetGitStatusResolution(t *testing.T) {
+	m := createTestModel()
+	m.GitStatuses = make(map[string]git.RepoGitStatus)
+
+	mainSt := git.RepoGitStatus{
+		RepoName:    "auth-service",
+		LocalPath:   "/workspaces/auth-service",
+		IsCloned:    true,
+		Branch:      "main",
+		State:       git.StateSynced,
+		HasUpstream: true,
+	}
+
+	m.GitStatuses["auth-service"] = mainSt
+	m.GitStatuses["acme/auth-service"] = mainSt
+	m.GitStatuses["auth-service.git"] = mainSt
+
+	// 1. Exact match
+	st := m.getGitStatus("auth-service")
+	if !st.IsCloned || st.Branch != "main" {
+		t.Errorf("expected cloned auth-service, got %+v", st)
+	}
+
+	// 2. Full name match
+	st = m.getGitStatus("acme/auth-service")
+	if !st.IsCloned || st.Branch != "main" {
+		t.Errorf("expected cloned for full name acme/auth-service, got %+v", st)
+	}
+
+	// 3. Short name extracted from full name
+	st = m.getGitStatus("other-org/auth-service")
+	if !st.IsCloned || st.Branch != "main" {
+		t.Errorf("expected cloned for short name resolution from other-org/auth-service, got %+v", st)
+	}
+
+	// 4. Normalized name (.git suffix removed)
+	st = m.getGitStatus("auth-service.git")
+	if !st.IsCloned || st.Branch != "main" {
+		t.Errorf("expected cloned for normalized auth-service.git, got %+v", st)
+	}
+
+	// 5. Unknown repo returns StateNotCloned
+	unknown := m.getGitStatus("completely-unknown-repo")
+	if unknown.IsCloned || unknown.State != git.StateNotCloned {
+		t.Errorf("expected not cloned for unknown repo, got %+v", unknown)
+	}
+}
+
+func TestGitStatusUpdatedMsg_PreservesOtherRepos(t *testing.T) {
+	m := createTestModel()
+	m.GitStatuses = make(map[string]git.RepoGitStatus)
+
+	// Initially we have auth-service and web-client in GitStatuses
+	m.GitStatuses["auth-service"] = git.RepoGitStatus{
+		RepoName:    "auth-service",
+		LocalPath:   "/workspaces/auth-service",
+		IsCloned:    true,
+		Branch:      "main",
+		State:       git.StateSynced,
+		HasUpstream: true,
+	}
+	m.GitStatuses["web-client"] = git.RepoGitStatus{
+		RepoName:    "web-client",
+		LocalPath:   "/workspaces/web-client",
+		IsCloned:    true,
+		Branch:      "feat-x",
+		IsDirty:     true,
+		Ahead:       1,
+		State:       git.StateDirty,
+		HasUpstream: true,
+	}
+
+	// Now simulate a refresh on just "api-gateway"
+	singleRefreshMsg := GitStatusUpdatedMsg{
+		Statuses: map[string]git.RepoGitStatus{
+			"api-gateway": {
+				RepoName:    "api-gateway",
+				LocalPath:   "/workspaces/api-gateway",
+				IsCloned:    true,
+				Branch:      "develop",
+				State:       git.StateSynced,
+				HasUpstream: true,
+			},
+		},
+	}
+
+	updated, _ := m.Update(singleRefreshMsg)
+	m = updated.(Model)
+
+	// Verify api-gateway was added
+	if st := m.getGitStatus("api-gateway"); !st.IsCloned || st.Branch != "develop" {
+		t.Errorf("expected api-gateway to be updated, got %+v", st)
+	}
+
+	// CRITICAL CHECK: auth-service and web-client MUST NOT have been wiped out!
+	if st := m.getGitStatus("auth-service"); !st.IsCloned || st.Branch != "main" {
+		t.Errorf("CRITICAL BUG: auth-service was wiped out when api-gateway was refreshed! Got %+v", st)
+	}
+	if st := m.getGitStatus("web-client"); !st.IsCloned || !st.IsDirty || st.Ahead != 1 {
+		t.Errorf("CRITICAL BUG: web-client was wiped out when api-gateway was refreshed! Got %+v", st)
+	}
+}
+
+func TestGitBadgeRenderingInRepoView(t *testing.T) {
+	m := createTestModel()
+	m.Width = 160
+	m.Height = 40
+	m.GitStatuses = make(map[string]git.RepoGitStatus)
+
+	// auth-service is synced on main
+	m.GitStatuses["auth-service"] = git.RepoGitStatus{
+		RepoName:    "auth-service",
+		LocalPath:   "/workspaces/auth-service",
+		IsCloned:    true,
+		Branch:      "main",
+		State:       git.StateSynced,
+		HasUpstream: true,
+	}
+
+	// web-client is dirty on feat-ui with ahead 1
+	m.GitStatuses["web-client"] = git.RepoGitStatus{
+		RepoName:    "web-client",
+		LocalPath:   "/workspaces/web-client",
+		IsCloned:    true,
+		Branch:      "feat-ui",
+		IsDirty:     true,
+		Ahead:       1,
+		State:       git.StateDirty,
+		HasUpstream: true,
+	}
+
+	// docs is not cloned
+	m.GitStatuses["docs"] = git.RepoGitStatus{
+		RepoName: "docs",
+		IsCloned: false,
+		State:    git.StateNotCloned,
+	}
+
+	// Render the repo list
+	view := m.View()
+
+	// Verify synced badge text "✓ main" is present
+	if !strings.Contains(view, "✓ main") {
+		t.Errorf("expected view to contain '✓ main' for synced auth-service, got:\n%s", view)
+	}
+
+	// Verify dirty badge text "* feat-ui ↑1" is present
+	if !strings.Contains(view, "* feat-ui ↑1") {
+		t.Errorf("expected view to contain '* feat-ui ↑1' for dirty web-client, got:\n%s", view)
+	}
+
+	// Verify not cloned badge text "[Not Cloned]" is present
+	if !strings.Contains(view, "[Not Cloned]") {
+		t.Errorf("expected view to contain '[Not Cloned]' for un-cloned docs, got:\n%s", view)
 	}
 }
 

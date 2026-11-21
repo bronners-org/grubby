@@ -369,7 +369,8 @@ func (c *Client) queryGraphQL(ctx context.Context, query string, variables map[s
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", "https://api.github.com/graphql", bytes.NewReader(body))
+		endpoint := c.apiBaseURLOrDefault() + "/graphql"
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 		if err != nil {
 			return err
 		}
@@ -941,15 +942,15 @@ query($searchQuery: String!, $cursor: String) {
 	return repos, prs, commitEvents, securityMap, nil
 }
 
-// FetchSingleRepo fetches metadata, default branch commit history, and vulnerability alerts for a single repo.
-func (c *Client) FetchSingleRepo(ctx context.Context, owner, repoName string) (*Repository, []SquadEvent, *SecurityAlertSummary, error) {
+// FetchSingleRepo fetches metadata, open PRs, default branch commit history, and vulnerability alerts for a single repo.
+func (c *Client) FetchSingleRepo(ctx context.Context, owner, repoName string) (*Repository, []PullRequest, []SquadEvent, *SecurityAlertSummary, error) {
 	cleanOwner := strings.TrimSpace(owner)
 	cleanRepo := strings.TrimSpace(repoName)
 	if cleanOwner == "" || cleanRepo == "" {
-		return nil, nil, nil, fmt.Errorf("owner and repo required")
+		return nil, nil, nil, nil, fmt.Errorf("owner and repo required")
 	}
 
-	query := `
+	queryWithAlerts := `
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     databaseId
@@ -995,58 +996,197 @@ query($owner: String!, $name: String!) {
         }
       }
     }
+    pullRequests(first: 30, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number
+        title
+        author {
+          login
+        }
+        createdAt
+        updatedAt
+        isDraft
+        reviewDecision
+        headRefName
+        url
+        labels(first: 5) {
+          nodes {
+            name
+          }
+        }
+        comments {
+          totalCount
+        }
+        reviewThreads(first: 30) {
+          totalCount
+          nodes {
+            isResolved
+          }
+        }
+      }
+    }
   }
 }
 `
-	var resp struct {
-		Repository *struct {
-			DatabaseID       *int64    `json:"databaseId"`
-			Name             string    `json:"name"`
-			NameWithOwner    string    `json:"nameWithOwner"`
-			Owner            struct {
-				Login string `json:"login"`
-			} `json:"owner"`
-			Description      *string   `json:"description"`
-			PushedAt         time.Time `json:"pushedAt"`
-			UpdatedAt        time.Time `json:"updatedAt"`
-			IsPrivate        bool      `json:"isPrivate"`
-			URL              string    `json:"url"`
-			SSHURL           string    `json:"sshUrl"`
-			DefaultBranchRef *struct {
-				Name   string `json:"name"`
-				Target *struct {
-					History struct {
-						Nodes []struct {
-							OID           string    `json:"oid"`
-							Message       string    `json:"message"`
-							CommittedDate time.Time `json:"committedDate"`
-							Author        struct {
-								Name string `json:"name"`
-								User *struct {
-									Login string `json:"login"`
-								} `json:"user"`
-							} `json:"author"`
-						} `json:"nodes"`
-					} `json:"history"`
-				} `json:"target"`
-			} `json:"defaultBranchRef"`
-			VulnerabilityAlerts struct {
-				TotalCount int `json:"totalCount"`
-				Nodes      []struct {
-					SecurityVulnerability struct {
-						Severity string `json:"severity"`
-						Package  struct {
+
+	queryFallback := `
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    databaseId
+    name
+    nameWithOwner
+    owner {
+      login
+    }
+    description
+    pushedAt
+    updatedAt
+    isPrivate
+    url
+    sshUrl
+    defaultBranchRef {
+      name
+      target {
+        ... on Commit {
+          history(first: 10) {
+            nodes {
+              oid
+              message
+              committedDate
+              author {
+                name
+                user {
+                  login
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    pullRequests(first: 30, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number
+        title
+        author {
+          login
+        }
+        createdAt
+        updatedAt
+        isDraft
+        reviewDecision
+        headRefName
+        url
+        labels(first: 5) {
+          nodes {
+            name
+          }
+        }
+        comments {
+          totalCount
+        }
+        reviewThreads(first: 30) {
+          totalCount
+          nodes {
+            isResolved
+          }
+        }
+      }
+    }
+  }
+}
+`
+
+	type singleRepoNode struct {
+		DatabaseID       *int64    `json:"databaseId"`
+		Name             string    `json:"name"`
+		NameWithOwner    string    `json:"nameWithOwner"`
+		Owner            struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+		Description      *string   `json:"description"`
+		PushedAt         time.Time `json:"pushedAt"`
+		UpdatedAt        time.Time `json:"updatedAt"`
+		IsPrivate        bool      `json:"isPrivate"`
+		URL              string    `json:"url"`
+		SSHURL           string    `json:"sshUrl"`
+		DefaultBranchRef *struct {
+			Name   string `json:"name"`
+			Target *struct {
+				History struct {
+					Nodes []struct {
+						OID           string    `json:"oid"`
+						Message       string    `json:"message"`
+						CommittedDate time.Time `json:"committedDate"`
+						Author        struct {
 							Name string `json:"name"`
-						} `json:"package"`
-					} `json:"securityVulnerability"`
-				} `json:"nodes"`
-			} `json:"vulnerabilityAlerts"`
-		} `json:"repository"`
+							User *struct {
+								Login string `json:"login"`
+							} `json:"user"`
+						} `json:"author"`
+					} `json:"nodes"`
+				} `json:"history"`
+			} `json:"target"`
+		} `json:"defaultBranchRef"`
+		VulnerabilityAlerts struct {
+			TotalCount int `json:"totalCount"`
+			Nodes      []struct {
+				SecurityVulnerability struct {
+					Severity string `json:"severity"`
+					Package  struct {
+						Name string `json:"name"`
+					} `json:"package"`
+				} `json:"securityVulnerability"`
+			} `json:"nodes"`
+		} `json:"vulnerabilityAlerts"`
+		PullRequests struct {
+			Nodes []struct {
+				Number     int    `json:"number"`
+				Title      string `json:"title"`
+				Author     *struct {
+					Login string `json:"login"`
+				} `json:"author"`
+				CreatedAt      time.Time `json:"createdAt"`
+				UpdatedAt      time.Time `json:"updatedAt"`
+				IsDraft        bool      `json:"isDraft"`
+				ReviewDecision *string   `json:"reviewDecision"`
+				HeadRefName    string    `json:"headRefName"`
+				URL            string    `json:"url"`
+				Labels         struct {
+					Nodes []struct {
+						Name string `json:"name"`
+					} `json:"nodes"`
+				} `json:"labels"`
+				Comments struct {
+					TotalCount int `json:"totalCount"`
+				} `json:"comments"`
+				ReviewThreads struct {
+					TotalCount int `json:"totalCount"`
+					Nodes      []struct {
+						IsResolved bool `json:"isResolved"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+			} `json:"nodes"`
+		} `json:"pullRequests"`
 	}
 
-	err := c.queryGraphQL(ctx, query, map[string]interface{}{"owner": cleanOwner, "name": cleanRepo}, &resp)
+	var resp struct {
+		Repository *singleRepoNode `json:"repository"`
+	}
+
+	err := c.queryGraphQL(ctx, queryWithAlerts, map[string]interface{}{"owner": cleanOwner, "name": cleanRepo}, &resp)
 	if err != nil || resp.Repository == nil {
-		return nil, nil, nil, err
+		var fallbackResp struct {
+			Repository *singleRepoNode `json:"repository"`
+		}
+		if fbErr := c.queryGraphQL(ctx, queryFallback, map[string]interface{}{"owner": cleanOwner, "name": cleanRepo}, &fallbackResp); fbErr == nil && fallbackResp.Repository != nil {
+			resp.Repository = fallbackResp.Repository
+			err = nil
+		} else if err != nil {
+			return nil, nil, nil, nil, err
+		} else {
+			return nil, nil, nil, nil, fmt.Errorf("repository %s/%s not found", cleanOwner, cleanRepo)
+		}
 	}
 
 	node := resp.Repository
@@ -1144,7 +1284,49 @@ query($owner: String!, $name: String!) {
 		LastScanned: time.Now(),
 	}
 
-	return repo, commitEvents, secSummary, nil
+	var prs []PullRequest
+	for _, p := range node.PullRequests.Nodes {
+		if p.Number == 0 {
+			continue
+		}
+		author := "unknown"
+		if p.Author != nil {
+			author = p.Author.Login
+		}
+		reviewDecision := "NONE"
+		if p.ReviewDecision != nil {
+			reviewDecision = *p.ReviewDecision
+		}
+		var labels []string
+		for _, l := range p.Labels.Nodes {
+			labels = append(labels, l.Name)
+		}
+		unresolved := 0
+		for _, t := range p.ReviewThreads.Nodes {
+			if !t.IsResolved {
+				unresolved++
+			}
+		}
+		prs = append(prs, PullRequest{
+			Number:             p.Number,
+			Repo:               node.Name,
+			RepoOwner:          realOwner,
+			RepoFullName:       realFullName,
+			Title:              p.Title,
+			Author:             author,
+			CreatedAt:          p.CreatedAt,
+			UpdatedAt:          p.UpdatedAt,
+			IsDraft:            p.IsDraft,
+			ReviewDecision:     reviewDecision,
+			HeadRefName:        p.HeadRefName,
+			URL:                p.URL,
+			Labels:             labels,
+			TotalComments:      p.Comments.TotalCount + p.ReviewThreads.TotalCount,
+			UnresolvedComments: unresolved,
+		})
+	}
+
+	return repo, prs, commitEvents, secSummary, nil
 }
 
 type OrgMember struct {

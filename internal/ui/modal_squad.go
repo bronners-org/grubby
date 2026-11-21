@@ -532,6 +532,7 @@ Global Navigation:
 Repositories Tab (1):
   [j/k] or [↑/↓]      Select repository, PR, or tier header
   [Space / Enter]     Toggle PR expansion (on repo) / Open PR (on PR row) / Toggle tier (on header)
+  [r]                 Refresh selected repository state via direct query
   [s]                 Open / switch dedicated session for selected repo
   [S]                 Sort leader: [v] Vulnerabilities, [p] Pull requests, [l] Last updated
   [f]                 Filter leader: [n] Name, [l] Label, [s] Squad filter toggle
