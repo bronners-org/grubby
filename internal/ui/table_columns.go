@@ -27,22 +27,23 @@ type RepoColumns struct {
 func computeRepoColumns(termWidth int) RepoColumns {
 	w := termWidth - 2
 	// Minimum width:
-	// Cursor (3) + Summary (28) + Git (16) + Session (12) + Last (13) + MinName (26) + MinPath (16) = 114
-	if w < 114 {
-		w = 114
+	// Cursor (3) + Summary (20) + Git (24) + MinName (24) + MinPath (18) = 89 -> 90
+	if w < 90 {
+		w = 90
 	}
 
-	summaryW := 28
-	fixedWidth := 3 + summaryW + 16 + 12 + 13 // 72
+	summaryW := 20
+	gitW := 24
+	fixedWidth := 3 + summaryW + gitW // 47
 	elastic := w - fixedWidth
 
 	nameW := elastic * 60 / 100
-	if nameW < 26 {
-		nameW = 26
+	if nameW < 24 {
+		nameW = 24
 	}
 	pathW := elastic - nameW
-	if pathW < 16 {
-		pathW = 16
+	if pathW < 18 {
+		pathW = 18
 		nameW = elastic - pathW
 	}
 
@@ -54,21 +55,21 @@ func computeRepoColumns(termWidth int) RepoColumns {
 		Cursor:       colStyle(3),
 		Name:         colStyle(nameW),
 		Summary:      colStyle(summaryW),
-		Git:          colStyle(16),
-		Session:      colStyle(12),
-		Last:         colStyle(13),
+		Git:          colStyle(gitW),
 		Path:         colStyle(pathW),
 		NameWidth:    nameW,
 		SummaryWidth: summaryW,
-		GitWidth:     16,
-		SessionWidth: 12,
-		LastWidth:    13,
+		GitWidth:     gitW,
 		PathWidth:    pathW,
 
 		// Backward compatibility aliases
-		Sec:        colStyle(summaryW),
-		Group:      colStyle(0),
-		GroupWidth: 0,
+		Session:      colStyle(0),
+		Last:         colStyle(0),
+		SessionWidth: 0,
+		LastWidth:    0,
+		Sec:          colStyle(summaryW),
+		Group:        colStyle(0),
+		GroupWidth:   0,
 	}
 }
 

@@ -184,3 +184,35 @@ func TestReactiveEvents_SetEventBus(t *testing.T) {
 		t.Errorf("expected non-nil Init cmd")
 	}
 }
+
+func TestReactiveEvents_HiddenRepoPRSuppression(t *testing.T) {
+	m := createTestModel()
+	m.HiddenRepos = map[string]bool{
+		"hidden-service": true,
+	}
+
+	pr := github.PullRequest{
+		Number:       88,
+		Repo:         "hidden-service",
+		RepoFullName: "corp/hidden-service",
+		Title:        "Feature in hidden repo",
+		Author:       "carol",
+		State:        "open",
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	openEvt, err := protocol.NewPullRequestEvent(protocol.ActionCreated, pr)
+	if err != nil {
+		t.Fatalf("failed to create pr event: %v", err)
+	}
+
+	updatedModel, _ := m.handleEntityEvent(openEvt)
+	// Verify SeenPRNotifications was marked so it won't re-trigger
+	if !updatedModel.SeenPRNotifications["hidden-service#88"] || !updatedModel.SeenPRNotifications["corp/hidden-service#88"] {
+		t.Errorf("expected SeenPRNotifications to have hidden-service#88 and corp/hidden-service#88, got: %+v", updatedModel.SeenPRNotifications)
+	}
+	// PR is added to list, but notification is suppressed (no panic, properly ignored)
+	if len(updatedModel.PRs) == 0 || updatedModel.PRs[0].Number != 88 {
+		t.Errorf("expected PR to be added to model PRs")
+	}
+}

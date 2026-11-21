@@ -757,8 +757,20 @@ func (c *Config) IsRepoHidden(repoName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	clean := strings.ToLower(strings.TrimSpace(repoName))
+	if clean == "" {
+		return false
+	}
+	short := clean
+	if idx := strings.LastIndex(clean, "/"); idx != -1 && idx < len(clean)-1 {
+		short = clean[idx+1:]
+	}
 	for _, r := range c.HiddenRepos {
-		if strings.ToLower(strings.TrimSpace(r)) == clean {
+		rClean := strings.ToLower(strings.TrimSpace(r))
+		rShort := rClean
+		if idx := strings.LastIndex(rClean, "/"); idx != -1 && idx < len(rClean)-1 {
+			rShort = rClean[idx+1:]
+		}
+		if rClean == clean || rShort == short || rClean == short || rShort == clean {
 			return true
 		}
 	}
@@ -772,11 +784,21 @@ func (c *Config) SetRepoHidden(repoName string, hidden bool) error {
 	}
 	c.mu.Lock()
 	clean := strings.ToLower(strings.TrimSpace(repoName))
+	short := clean
+	if idx := strings.LastIndex(clean, "/"); idx != -1 && idx < len(clean)-1 {
+		short = clean[idx+1:]
+	}
 	var updated []string
 	for _, r := range c.HiddenRepos {
-		if strings.ToLower(strings.TrimSpace(r)) != clean {
-			updated = append(updated, r)
+		rClean := strings.ToLower(strings.TrimSpace(r))
+		rShort := rClean
+		if idx := strings.LastIndex(rClean, "/"); idx != -1 && idx < len(rClean)-1 {
+			rShort = rClean[idx+1:]
 		}
+		if rClean == clean || rShort == short || rClean == short || rShort == clean {
+			continue
+		}
+		updated = append(updated, r)
 	}
 	if hidden {
 		updated = append(updated, repoName)

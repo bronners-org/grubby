@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/mattn/go-runewidth"
 )
 
 type GitState string
@@ -23,37 +25,120 @@ const (
 )
 
 type RepoGitStatus struct {
-	RepoName  string
-	LocalPath string
-	IsCloned  bool
-	Branch    string
-	IsDirty   bool
-	Ahead     int
-	Behind    int
-	State     GitState
+	RepoName    string
+	LocalPath   string
+	IsCloned    bool
+	Branch      string
+	IsDirty     bool
+	Ahead       int
+	Behind      int
+	State       GitState
+	HasUpstream bool
 }
 
 func (s RepoGitStatus) Badge() string {
 	if !s.IsCloned {
 		return "[Not Cloned]"
 	}
-	if s.IsDirty {
-		return "[* dirty]"
+
+	branch := s.Branch
+	if branch == "" {
+		branch = "main"
 	}
+
+	var syncParts []string
+	if s.Ahead > 0 {
+		syncParts = append(syncParts, fmt.Sprintf("↑%d", s.Ahead))
+	}
+	if s.Behind > 0 {
+		syncParts = append(syncParts, fmt.Sprintf("↓%d", s.Behind))
+	}
+	syncInfo := strings.Join(syncParts, " ")
+
+	if s.IsDirty {
+		if syncInfo != "" {
+			return fmt.Sprintf("* %s %s", branch, syncInfo)
+		}
+		return fmt.Sprintf("* %s", branch)
+	}
+
 	switch s.State {
 	case StateBehind:
-		return fmt.Sprintf("[↓ %d behind]", s.Behind)
+		return fmt.Sprintf("↓%d %s", s.Behind, branch)
 	case StateAhead:
-		return fmt.Sprintf("[↑ %d ahead]", s.Ahead)
+		return fmt.Sprintf("↑%d %s", s.Ahead, branch)
 	case StateDiverged:
-		return fmt.Sprintf("[⇡%d ⇣%d diverged]", s.Ahead, s.Behind)
-	case StateSynced:
-		return "[✓ synced]"
+		return fmt.Sprintf("⇡%d ⇣%d %s", s.Ahead, s.Behind, branch)
 	case StateNoUpstream:
-		return "[no upstream]"
+		return fmt.Sprintf("? %s", branch)
+	case StateSynced:
+		return fmt.Sprintf("✓ %s", branch)
 	default:
-		return "[local]"
+		if syncInfo != "" {
+			return fmt.Sprintf("%s %s", branch, syncInfo)
+		}
+		return fmt.Sprintf("✓ %s", branch)
 	}
+}
+
+// ShortBadge returns the badge formatted and truncated to fit within maxWidth columns
+func (s RepoGitStatus) ShortBadge(maxWidth int) string {
+	full := s.Badge()
+	if maxWidth <= 0 || runewidth.StringWidth(full) <= maxWidth {
+		return full
+	}
+
+	if !s.IsCloned {
+		return "[Not Cloned]"
+	}
+
+	branch := s.Branch
+	if branch == "" {
+		branch = "main"
+	}
+
+	var syncParts []string
+	if s.Ahead > 0 {
+		syncParts = append(syncParts, fmt.Sprintf("↑%d", s.Ahead))
+	}
+	if s.Behind > 0 {
+		syncParts = append(syncParts, fmt.Sprintf("↓%d", s.Behind))
+	}
+	syncInfo := strings.Join(syncParts, " ")
+
+	var prefix, suffix string
+	if s.IsDirty {
+		prefix = "* "
+		if syncInfo != "" {
+			suffix = " " + syncInfo
+		}
+	} else if s.Ahead > 0 && s.Behind > 0 {
+		prefix = fmt.Sprintf("⇡%d ⇣%d ", s.Ahead, s.Behind)
+	} else if s.Ahead > 0 {
+		prefix = fmt.Sprintf("↑%d ", s.Ahead)
+	} else if s.Behind > 0 {
+		prefix = fmt.Sprintf("↓%d ", s.Behind)
+	} else if !s.HasUpstream || s.State == StateNoUpstream {
+		prefix = "? "
+	} else {
+		prefix = "✓ "
+	}
+
+	prefixW := runewidth.StringWidth(prefix)
+	suffixW := runewidth.StringWidth(suffix)
+	avail := maxWidth - prefixW - suffixW
+	if avail < 3 {
+		if s.IsDirty {
+			if syncInfo != "" && runewidth.StringWidth("* "+syncInfo) <= maxWidth {
+				return "* " + syncInfo
+			}
+			return "* dirty"
+		}
+		return runewidth.Truncate(full, maxWidth, "…")
+	}
+
+	shortBranch := runewidth.Truncate(branch, avail, "…")
+	return prefix + shortBranch + suffix
 }
 
 // InspectRepo returns the git status of a local directory
@@ -66,7 +151,7 @@ func InspectRepo(ctx context.Context, repoName, dir string) RepoGitStatus {
 	}
 
 	gitDir := filepath.Join(dir, ".git")
-	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
+	if _, err := os.Stat(gitDir); err != nil {
 		return st
 	}
 	st.IsCloned = true
@@ -74,7 +159,18 @@ func InspectRepo(ctx context.Context, repoName, dir string) RepoGitStatus {
 	// Check branch
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD")
 	if out, err := cmd.Output(); err == nil {
-		st.Branch = strings.TrimSpace(string(out))
+		branch := strings.TrimSpace(string(out))
+		if branch == "HEAD" {
+			// Detached HEAD: resolve to short sha or tag
+			shaCmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--short", "HEAD")
+			if shaOut, err := shaCmd.Output(); err == nil {
+				st.Branch = "@" + strings.TrimSpace(string(shaOut))
+			} else {
+				st.Branch = "detached"
+			}
+		} else {
+			st.Branch = branch
+		}
 	} else {
 		st.Branch = "main"
 	}
@@ -94,9 +190,11 @@ func InspectRepo(ctx context.Context, repoName, dir string) RepoGitStatus {
 		if len(parts) == 2 {
 			st.Ahead, _ = strconv.Atoi(parts[0])
 			st.Behind, _ = strconv.Atoi(parts[1])
+			st.HasUpstream = true
 		}
 	} else {
-		// Could mean no upstream branch configured
+		// No upstream branch configured
+		st.HasUpstream = false
 		st.State = StateNoUpstream
 		if st.IsDirty {
 			st.State = StateDirty

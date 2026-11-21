@@ -191,12 +191,16 @@ func (m Model) patchPullRequest(env protocol.EventEnvelope) (Model, tea.Cmd) {
 			}
 			if env.Action == protocol.ActionCreated || !found {
 				prKey := fmt.Sprintf("%s#%d", pr.DisplayRepo(), pr.Number)
+				repoKey := fmt.Sprintf("%s#%d", pr.Repo, pr.Number)
 				if m.SeenPRNotifications == nil {
 					m.SeenPRNotifications = make(map[string]bool)
 				}
-				if !m.SeenPRNotifications[prKey] {
+				if !m.SeenPRNotifications[prKey] && !m.SeenPRNotifications[repoKey] {
 					m.SeenPRNotifications[prKey] = true
-					SendPRNotification(pr)
+					m.SeenPRNotifications[repoKey] = true
+					if !m.isRepoHidden(pr.Repo) && !m.isRepoHidden(pr.RepoFullName) && !m.isRepoHidden(pr.DisplayRepo()) {
+						SendPRNotification(pr)
+					}
 				}
 			}
 			actionWord := "updated"

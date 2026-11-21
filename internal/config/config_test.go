@@ -137,6 +137,16 @@ func TestConfigLoadAndSave(t *testing.T) {
 		t.Errorf("expected core-tasks to be unhidden")
 	}
 
+	// Full name and short name matching
+	_ = cfg.SetRepoHidden("corp/payment-service", true)
+	if !cfg.IsRepoHidden("payment-service") || !cfg.IsRepoHidden("corp/payment-service") {
+		t.Errorf("expected payment-service to be hidden for both short and full names")
+	}
+	_ = cfg.SetRepoHidden("auth-service", true)
+	if !cfg.IsRepoHidden("corp/auth-service") || !cfg.IsRepoHidden("auth-service") {
+		t.Errorf("expected auth-service to be hidden for both short and full names")
+	}
+
 	// Test Central Tasks Repo Resolution
 	// 1. Unset: defaultOrg/grubby-tasks
 	o, r := cfg.GetCentralTasksRepo("acme-corp")

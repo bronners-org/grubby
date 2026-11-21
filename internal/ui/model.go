@@ -116,6 +116,7 @@ type RepoClonedMsg struct {
 
 type SingleRepoLoadedMsg struct {
 	Repo     *github.Repository
+	PRs      []github.PullRequest
 	Events   []github.SquadEvent
 	Security *github.SecurityAlertSummary
 	Err      error
@@ -248,6 +249,7 @@ type Model struct {
 	SeenNotificationIDs map[string]bool
 	SeenPRNotifications map[string]bool
 	GitStatuses         map[string]git.RepoGitStatus
+	ScanningGit         bool
 	RateLimit           github.RateLimitInfo
 	Loading             bool
 	InitialDataLoaded   bool
@@ -951,9 +953,10 @@ func (m Model) fetchSingleRepoCmd(owner, repoName string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		repo, events, secAlert, err := m.GHClient.FetchSingleRepo(ctx, owner, repoName)
+		repo, prs, events, secAlert, err := m.GHClient.FetchSingleRepo(ctx, owner, repoName)
 		return SingleRepoLoadedMsg{
 			Repo:     repo,
+			PRs:      prs,
 			Events:   events,
 			Security: secAlert,
 			Err:      err,
@@ -963,10 +966,21 @@ func (m Model) fetchSingleRepoCmd(owner, repoName string) tea.Cmd {
 
 func (m Model) scanWorkspacesCmd(repoNames []string) tea.Cmd {
 	return func() tea.Msg {
+		if m.GitMgr == nil {
+			return GitStatusUpdatedMsg{Statuses: nil}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		statuses := m.GitMgr.ScanWorkspaces(ctx, repoNames)
+		names := repoNames
+		if len(names) == 0 && len(m.Repos) > 0 {
+			names = make([]string, len(m.Repos))
+			for i, r := range m.Repos {
+				names[i] = r.Name
+			}
+		}
+
+		statuses := m.GitMgr.ScanWorkspaces(ctx, names)
 		return GitStatusUpdatedMsg{Statuses: statuses}
 	}
 }
@@ -1316,6 +1330,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.emitSquadMemberAvatarsCmd())
 		}
 
+		// Fast lightweight workspace scan to immediately detect local branch / dirty changes
+		if len(m.Repos) > 0 && m.GitMgr != nil && !m.ScanningGit {
+			m.ScanningGit = true
+			repoNames := make([]string, len(m.Repos))
+			for i, r := range m.Repos {
+				repoNames[i] = r.Name
+			}
+			cmds = append(cmds, m.scanWorkspacesCmd(repoNames))
+		}
+
 		// Poll GitHub Status every 60 seconds
 		if time.Since(m.LastStatusCheck) >= 60*time.Second {
 			m.LastStatusCheck = time.Now()
@@ -1404,7 +1428,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case SingleRepoLoadedMsg:
-		if msg.Err == nil && msg.Repo != nil {
+		if msg.Err != nil {
+			m.StatusMsg = fmt.Sprintf("Failed to refresh repository: %v", msg.Err)
+			m.StatusMsgTimer = time.Now().Add(5 * time.Second)
+			return m, nil
+		}
+		if msg.Repo != nil {
 			found := false
 			for i := range m.Repos {
 				if strings.EqualFold(m.Repos[i].Name, msg.Repo.Name) {
@@ -1417,7 +1446,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Repos = append(m.Repos, *msg.Repo)
 			}
 
-			tier := storage.CalculateRepoTier(*msg.Repo, nil, msg.Events)
+			// Update PRs for this repository
+			var remainingPRs []github.PullRequest
+			for _, p := range m.PRs {
+				if strings.EqualFold(p.Repo, msg.Repo.Name) ||
+					(p.RepoFullName != "" && strings.EqualFold(p.RepoFullName, msg.Repo.FullName)) {
+					continue
+				}
+				remainingPRs = append(remainingPRs, p)
+			}
+			m.PRs = append(remainingPRs, msg.PRs...)
+
+			tier := storage.CalculateRepoTier(*msg.Repo, msg.PRs, msg.Events)
+			if m.isRepoHidden(msg.Repo.Name) {
+				tier = storage.TierHidden
+			}
 			if m.RepoTiers == nil {
 				m.RepoTiers = make(map[string]storage.RepoTier)
 			}
@@ -1436,7 +1479,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if msg.Security != nil {
 					_ = m.DB.SaveSecuritySummaries(map[string]github.SecurityAlertSummary{msg.Repo.Name: *msg.Security})
 				}
+				_ = m.DB.SavePullRequests(m.PRs)
 			}
+			m.recordEntityFlash("repo:" + msg.Repo.FullName)
+			m.recordEntityFlash("repo:" + msg.Repo.Name)
 			m.StatusMsg = fmt.Sprintf("✓ Refreshed %s (%s)", msg.Repo.Name, storage.TierBadgeText(tier))
 			m.StatusMsgTimer = time.Now().Add(3 * time.Second)
 		}
@@ -1624,15 +1670,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.RepoCursor = m.firstSelectableRepoIndex()
 		}
 
-		// Process notifications and alert for new unread items
+		// Process notifications and alert for new unread items (suppressed for hidden repos)
+		if m.SeenNotificationIDs == nil {
+			m.SeenNotificationIDs = make(map[string]bool)
+		}
 		var newNotifs []github.Notification
 		for _, n := range msg.Notifications {
+			if m.isRepoHidden(n.Repository) {
+				m.SeenNotificationIDs[n.ID] = true
+				continue
+			}
 			if n.Unread && !m.SeenNotificationIDs[n.ID] {
 				newNotifs = append(newNotifs, n)
 				m.SeenNotificationIDs[n.ID] = true
 			}
 		}
-		m.Notifications = msg.Notifications
+		var activeNotifs []github.Notification
+		for _, n := range msg.Notifications {
+			if !m.isRepoHidden(n.Repository) {
+				activeNotifs = append(activeNotifs, n)
+			}
+		}
+		m.Notifications = activeNotifs
 
 		if len(newNotifs) > 0 {
 			for _, n := range newNotifs {
@@ -1726,7 +1785,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case GitStatusUpdatedMsg:
-		m.GitStatuses = msg.Statuses
+		m.ScanningGit = false
+		if m.GitStatuses == nil {
+			m.GitStatuses = make(map[string]git.RepoGitStatus)
+		}
+		for k, v := range msg.Statuses {
+			m.GitStatuses[k] = v
+			clean := strings.ToLower(k)
+			m.GitStatuses[clean] = v
+			if strings.Contains(clean, "/") {
+				short := clean[strings.LastIndex(clean, "/")+1:]
+				m.GitStatuses[short] = v
+			}
+			norm := strings.ToLower(github.NormalizeRepoName(k))
+			m.GitStatuses[norm] = v
+		}
+		return m, nil
 
 	case RepoClonedMsg:
 		if msg.Err != nil {
@@ -1734,7 +1808,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.StatusMsgTimer = time.Now().Add(5 * time.Second)
 			return m, nil
 		}
+		if m.GitStatuses == nil {
+			m.GitStatuses = make(map[string]git.RepoGitStatus)
+		}
 		m.GitStatuses[msg.RepoName] = msg.Status
+		m.GitStatuses[strings.ToLower(msg.RepoName)] = msg.Status
+		if strings.Contains(msg.RepoName, "/") {
+			short := msg.RepoName[strings.LastIndex(msg.RepoName, "/")+1:]
+			m.GitStatuses[short] = msg.Status
+		}
+		m.GitStatuses[strings.ToLower(github.NormalizeRepoName(msg.RepoName))] = msg.Status
 		collapsed := config.CollapseHome(msg.TargetDir)
 
 		switch msg.PostAction {
@@ -2061,6 +2144,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ActiveModal = ModalHelp
 			return m, nil
 		case "r":
+			if m.ActiveTab == TabRepos {
+				return m.handleReposKeys(msg)
+			}
+			if m.ActiveTab == TabStatus {
+				return m.handleStatusKeys(msg)
+			}
 			m.Loading = true
 			m.LastRefreshTime = time.Now()
 			m.LastStatusCheck = time.Now()
@@ -2350,11 +2439,11 @@ func (m Model) renderFooter() string {
 			if isTierHeader {
 				help = "[Space/Enter] Toggle Tier  [Left/h] Collapse  [Right/l] Expand  [Z] Collapse All  [E] Expand All  [j/k] Navigate  [?] Help"
 			} else if isPRItem {
-				help = "[Enter/o] Open PR  [m] Merge  [p] Copilot  [k/c] Checkout  [s] Session  [t] Task  [y] Yank  [Left/h] Parent  [C] Claim  [?] Help"
+				help = "[Enter/o] Open PR  [m] Merge  [p] Copilot  [k/c] Checkout  [s] Session  [t] Task  [y] Yank  [r] Refresh  [Left/h] Parent  [C] Claim  [?] Help"
 			} else if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortMode != RepoSortDefault || m.RepoSortVulnerabilities || m.SquadFilterActive {
-				help = "[Enter] Toggle PRs  [s] Session  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [Esc] Clear  [?] Help"
+				help = "[Enter] Toggle PRs  [s] Session  [r] Refresh  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [Esc] Clear  [?] Help"
 			} else {
-				help = "[Enter] Toggle PRs  [s] Session  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [?] Help"
+				help = "[Enter] Toggle PRs  [s] Session  [r] Refresh  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [?] Help"
 			}
 		}
 	case TabTasks:
@@ -2548,14 +2637,29 @@ func (m Model) recordRepoInteraction(repoName string) Model {
 
 func (m Model) isRepoHidden(repoName string) bool {
 	clean := strings.ToLower(strings.TrimSpace(repoName))
-	if m.HiddenRepos != nil && m.HiddenRepos[clean] {
-		return true
+	if clean == "" {
+		return false
 	}
-	if m.DB != nil && m.DB.IsRepoHidden(repoName) {
-		return true
+	short := clean
+	if idx := strings.LastIndex(clean, "/"); idx != -1 && idx < len(clean)-1 {
+		short = clean[idx+1:]
 	}
-	if m.Config != nil && m.Config.IsRepoHidden(repoName) {
-		return true
+	norm := strings.ToLower(github.NormalizeRepoName(clean))
+
+	if m.HiddenRepos != nil {
+		if m.HiddenRepos[clean] || m.HiddenRepos[short] || m.HiddenRepos[norm] {
+			return true
+		}
+	}
+	if m.DB != nil {
+		if m.DB.IsRepoHidden(clean) || m.DB.IsRepoHidden(short) || m.DB.IsRepoHidden(norm) {
+			return true
+		}
+	}
+	if m.Config != nil {
+		if m.Config.IsRepoHidden(clean) || m.Config.IsRepoHidden(short) || m.Config.IsRepoHidden(norm) {
+			return true
+		}
 	}
 	return false
 }
@@ -2688,7 +2792,8 @@ func (m Model) getRepoLastInteractedTime(repoName string, tmuxSessions map[strin
 	}
 
 	// 4. Local git index modified time
-	if st, ok := m.GitStatuses[repoName]; ok && st.IsCloned && st.IsDirty {
+	st := m.getGitStatus(repoName)
+	if st.IsCloned && st.IsDirty {
 		indexPath := filepath.Join(st.LocalPath, ".git", "index")
 		if info, err := os.Stat(indexPath); err == nil {
 			if info.ModTime().After(t) {
@@ -2698,6 +2803,33 @@ func (m Model) getRepoLastInteractedTime(repoName string, tmuxSessions map[strin
 	}
 
 	return t
+}
+
+func (m Model) getGitStatus(repoName string) git.RepoGitStatus {
+	if m.GitStatuses == nil {
+		return git.RepoGitStatus{RepoName: repoName, State: git.StateNotCloned}
+	}
+	if st, ok := m.GitStatuses[repoName]; ok && st.IsCloned {
+		return st
+	}
+	clean := strings.ToLower(repoName)
+	if st, ok := m.GitStatuses[clean]; ok && st.IsCloned {
+		return st
+	}
+	if strings.Contains(clean, "/") {
+		short := clean[strings.LastIndex(clean, "/")+1:]
+		if st, ok := m.GitStatuses[short]; ok && st.IsCloned {
+			return st
+		}
+	}
+	norm := strings.ToLower(github.NormalizeRepoName(clean))
+	if st, ok := m.GitStatuses[norm]; ok && st.IsCloned {
+		return st
+	}
+	if st, ok := m.GitStatuses[repoName]; ok {
+		return st
+	}
+	return git.RepoGitStatus{RepoName: repoName, State: git.StateNotCloned}
 }
 
 func (m Model) getLabelColor(label string) string {
