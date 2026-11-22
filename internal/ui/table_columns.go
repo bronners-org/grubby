@@ -27,14 +27,14 @@ type RepoColumns struct {
 func computeRepoColumns(termWidth int) RepoColumns {
 	w := termWidth - 2
 	// Minimum width:
-	// Cursor (3) + Summary (20) + Git (24) + MinName (24) + MinPath (18) = 89 -> 90
+	// Cursor (3) + Summary (21) + Git (24) + MinName (24) + MinPath (18) = 90
 	if w < 90 {
 		w = 90
 	}
 
-	summaryW := 20
+	summaryW := 21
 	gitW := 24
-	fixedWidth := 3 + summaryW + gitW // 47
+	fixedWidth := 3 + summaryW + gitW // 48
 	elastic := w - fixedWidth
 
 	nameW := elastic * 60 / 100

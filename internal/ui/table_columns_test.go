@@ -19,7 +19,7 @@ func TestComputeRepoColumns(t *testing.T) {
 			target = 90
 		}
 
-		fixedWidth := 3 + 20 + 24 // 47
+		fixedWidth := 3 + 21 + 24 // 48
 		total := fixedWidth + cols.NameWidth + cols.PathWidth
 
 		if total != target {

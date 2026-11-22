@@ -1650,37 +1650,37 @@ func (m Model) renderReposView() string {
 			}
 		}
 
-		// 3. (Vulns - Issues) column: ( 0 0 0 ) / ( 1 2 3 ) - ( taskCount )
+		// 3. (Vulns - Issues) column: ( clear ✓✓ ) / ( 01 06 05 ) - ( taskCount )
 		var vulnText string
 		sum := m.SecuritySummaries[r.Name]
 		if isDead {
-			deadStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681"))
+			deadStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6E7681")).Italic(true)
 			if sum.Total == 0 {
-				vulnText = deadStyle.Render("( 0 0 0 )")
+				vulnText = deadStyle.Render("( clear ✓✓ )")
 			} else {
 				medRest := sum.Medium + sum.Low
-				vulnText = deadStyle.Render(fmt.Sprintf("( %d %d %d )", sum.Critical, sum.High, medRest))
+				vulnText = deadStyle.Render(fmt.Sprintf("( %02d %02d %02d )", sum.Critical, sum.High, medRest))
 			}
 		} else {
 			if sum.Total == 0 {
-				vulnText = lipgloss.NewStyle().Foreground(SuccessColor).Render("( 0 0 0 )")
+				vulnText = ClearBadgeStyle.Render("( clear ✓✓ )")
 			} else {
 				medRest := sum.Medium + sum.Low
 				var cStr, hStr, mStr string
 				if sum.Critical > 0 {
-					cStr = lipgloss.NewStyle().Foreground(DangerColor).Bold(true).Render(fmt.Sprintf("%d", sum.Critical))
+					cStr = lipgloss.NewStyle().Foreground(DangerColor).Bold(true).Render(fmt.Sprintf("%02d", sum.Critical))
 				} else {
-					cStr = lipgloss.NewStyle().Foreground(MutedColor).Render("0")
+					cStr = lipgloss.NewStyle().Foreground(MutedColor).Render("00")
 				}
 				if sum.High > 0 {
-					hStr = lipgloss.NewStyle().Foreground(WarningColor).Bold(true).Render(fmt.Sprintf("%d", sum.High))
+					hStr = lipgloss.NewStyle().Foreground(WarningColor).Bold(true).Render(fmt.Sprintf("%02d", sum.High))
 				} else {
-					hStr = lipgloss.NewStyle().Foreground(MutedColor).Render("0")
+					hStr = lipgloss.NewStyle().Foreground(MutedColor).Render("00")
 				}
 				if medRest > 0 {
-					mStr = lipgloss.NewStyle().Foreground(lipgloss.Color("#E5C07B")).Bold(true).Render(fmt.Sprintf("%d", medRest))
+					mStr = lipgloss.NewStyle().Foreground(lipgloss.Color("#E5C07B")).Bold(true).Render(fmt.Sprintf("%02d", medRest))
 				} else {
-					mStr = lipgloss.NewStyle().Foreground(MutedColor).Render("0")
+					mStr = lipgloss.NewStyle().Foreground(MutedColor).Render("00")
 				}
 				vulnText = fmt.Sprintf("( %s %s %s )", cStr, hStr, mStr)
 			}
