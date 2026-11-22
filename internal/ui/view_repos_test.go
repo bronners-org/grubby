@@ -9,6 +9,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 
 	"grubby/internal/config"
 	"grubby/internal/git"
@@ -966,15 +967,15 @@ func TestSummaryColumnAndInlineLabelsRendering(t *testing.T) {
 		t.Errorf("expected repository About text in repo view, got:\n%s", view)
 	}
 
-	// 4. Verify (Vulns - Issues) format: ( 1 2 2 ) - ( 3 ) without PRs in this column
-	if !strings.Contains(view, "( 1 2 2 )") {
-		t.Errorf("expected '( 1 2 2 )' vulnerabilities without commas, got:\n%s", view)
+	// 4. Verify (Vulns - Issues) format: ( 01 02 02 ) - ( 3 ) with 2-digit alignment
+	if !strings.Contains(view, "( 01 02 02 )") {
+		t.Errorf("expected '( 01 02 02 )' vulnerabilities with 2-digit alignment, got:\n%s", view)
 	}
 	if !strings.Contains(view, "( 3 )") {
 		t.Errorf("expected ( 3 ) task count in column, got:\n%s", view)
 	}
 	// Verify that the summary column does NOT contain the separate ( 2 ) PR badge between vulns and tasks
-	if strings.Contains(view, "( 1 2 2 ) - ( 2 ) - ( 3 )") {
+	if strings.Contains(view, "( 01 02 02 ) - ( 2 ) - ( 3 )") {
 		t.Errorf("expected PR count to be removed from (Vulns - Issues) column, got:\n%s", view)
 	}
 	// Verify that PR count is shown in the REPOSITORY & LABELS column
@@ -982,11 +983,14 @@ func TestSummaryColumnAndInlineLabelsRendering(t *testing.T) {
 		t.Errorf("expected '[▶ 2 PRs]' in REPOSITORY & LABELS column, got:\n%s", view)
 	}
 
-	// 5. Test clean repo with 0 vulnerabilities renders green ( 0 0 0 ) without commas
+	// 5. Test clean repo with 0 vulnerabilities renders washed out italic ( clear ✓✓ )
 	m.SecuritySummaries["auth-svc"] = github.SecurityAlertSummary{Total: 0}
 	viewClean := m.renderReposView()
-	if !strings.Contains(viewClean, "( 0 0 0 )") {
-		t.Errorf("expected '( 0 0 0 )' without commas for 0 vulnerabilities, got:\n%s", viewClean)
+	if !strings.Contains(viewClean, "( clear ✓✓ )") {
+		t.Errorf("expected '( clear ✓✓ )' for 0 vulnerabilities, got:\n%s", viewClean)
+	}
+	if strings.Contains(viewClean, "( 0 0 0 )") || strings.Contains(viewClean, "( 00 00 00 )") || strings.Contains(viewClean, "👍") {
+		t.Errorf("expected 0 vulnerabilities to render as '( clear ✓✓ )', got:\n%s", viewClean)
 	}
 
 	// 6. Verify single spinner indicator in top tier bar when Loading is true
@@ -994,6 +998,21 @@ func TestSummaryColumnAndInlineLabelsRendering(t *testing.T) {
 	loadingView := m.renderReposView()
 	if !strings.Contains(loadingView, "Syncing...") {
 		t.Errorf("expected 'Syncing...' in tier bar when Loading is true, got:\n%s", loadingView)
+	}
+}
+
+func TestVulnColumnWidthAlignment(t *testing.T) {
+	// ( clear ✓✓ ) and ( 01 06 05 ) must have identical visual width (12 cells)
+	wClean := runewidth.StringWidth("( clear ✓✓ )")
+	wVuln := runewidth.StringWidth("( 01 06 05 )")
+	if wClean != 12 {
+		t.Errorf("expected ( clear ✓✓ ) width to be 12, got %d", wClean)
+	}
+	if wVuln != 12 {
+		t.Errorf("expected ( 01 06 05 ) width to be 12, got %d", wVuln)
+	}
+	if wClean != wVuln {
+		t.Errorf("widths do not match for vertical alignment: %d != %d", wClean, wVuln)
 	}
 }
 

@@ -5,9 +5,10 @@ import "github.com/charmbracelet/lipgloss"
 var (
 	// Base Colors
 	PrimaryColor   = lipgloss.Color("#7D56F4") // Purple
-	SecondaryColor = lipgloss.Color("#00D7D7") // Cyan
-	SuccessColor   = lipgloss.Color("#04B575") // Green
-	WarningColor   = lipgloss.Color("#FFAF00") // Amber
+	SecondaryColor   = lipgloss.Color("#00D7D7") // Cyan
+	SuccessColor     = lipgloss.Color("#04B575") // Green
+	PaleSuccessColor = lipgloss.Color("#5E8B75") // Washed-out Pale Green
+	WarningColor     = lipgloss.Color("#FFAF00") // Amber
 	DangerColor    = lipgloss.Color("#FF5F87") // Coral Red
 	MutedColor     = lipgloss.Color("#626262") // Dim Gray
 	DarkBgColor    = lipgloss.Color("#14141E") // Shade darker than tabs
@@ -65,6 +66,10 @@ var (
 	SyncedBadge = lipgloss.NewStyle().
 			Foreground(SuccessColor).
 			Bold(true)
+
+	ClearBadgeStyle = lipgloss.NewStyle().
+			Foreground(PaleSuccessColor).
+			Italic(true)
 
 	BehindBadge = lipgloss.NewStyle().
 			Foreground(WarningColor).
