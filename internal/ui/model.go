@@ -421,6 +421,7 @@ type Model struct {
 	ThreadsCursor               int
 	ThreadsExpandedID           string
 	ThreadsCollapsedIDs         map[string]bool
+	ThreadsCollapsedTiers       map[ThreadTier]bool
 	ThreadsReplyActive          bool
 	ThreadsReplyDiscussionID    string
 	ThreadsReplyInput           textarea.Model
@@ -598,6 +599,10 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 		ThreadEditMessageInput: thEditMsg,
 		ThreadsSelectedMsgIdx: -1,
 		ThreadsCollapsedIDs:   make(map[string]bool),
+		ThreadsCollapsedTiers: map[ThreadTier]bool{
+			ThreadTierCold: true,
+			ThreadTierDead: true,
+		},
 		SeenMessages:         make(map[string]bool),
 	}
 
@@ -3397,6 +3402,27 @@ func (m Model) isThreadExpanded(discID string, hasUnread bool) bool {
 		return true
 	}
 	return false
+}
+
+// isThreadTierCollapsed returns true if the specified thread tier category is collapsed.
+// By default, Hot and Warm are open (false), and Cold and Dead are closed (true).
+func (m Model) isThreadTierCollapsed(tier ThreadTier) bool {
+	if (tier == ThreadTierCold || tier == ThreadTierDead) && m.ThreadsDeadExpanded {
+		if m.ThreadsCollapsedTiers != nil {
+			if collapsed, ok := m.ThreadsCollapsedTiers[tier]; ok {
+				return collapsed
+			}
+		}
+		return false
+	}
+	if m.ThreadsCollapsedTiers == nil {
+		return tier == ThreadTierCold || tier == ThreadTierDead
+	}
+	collapsed, ok := m.ThreadsCollapsedTiers[tier]
+	if !ok {
+		return tier == ThreadTierCold || tier == ThreadTierDead
+	}
+	return collapsed
 }
 
 func (m *Model) markCurrentThreadViewed() {

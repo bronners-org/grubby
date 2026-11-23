@@ -46,6 +46,13 @@ type Discussion struct {
 	CommentsCount int                 `json:"comments_count"`
 	Comments      []DiscussionComment `json:"comments,omitempty"`
 	LastReadAt    time.Time           `json:"last_read_at,omitempty"`
+	Closed        bool                `json:"closed,omitempty"`
+	State         string              `json:"state,omitempty"`
+}
+
+// IsClosed returns true if the discussion has been closed or resolved.
+func (d Discussion) IsClosed() bool {
+	return d.Closed || strings.EqualFold(d.State, "closed")
 }
 
 // GetDiscussionCategories retrieves all categories enabled for discussions in a repo.
@@ -105,6 +112,7 @@ func (c *Client) FetchDiscussions(ctx context.Context, owner, repo, categoryID s
 					createdAt
 					updatedAt
 					url
+					closed
 					author {
 						login
 					}
@@ -156,6 +164,7 @@ func (c *Client) FetchDiscussions(ctx context.Context, owner, repo, categoryID s
 					CreatedAt time.Time `json:"createdAt"`
 					UpdatedAt time.Time `json:"updatedAt"`
 					URL       string    `json:"url"`
+					Closed    bool      `json:"closed"`
 					Author    *struct {
 						Login string `json:"login"`
 					} `json:"author"`
@@ -223,6 +232,10 @@ func (c *Client) FetchDiscussions(ctx context.Context, owner, repo, categoryID s
 			})
 		}
 
+		state := "open"
+		if n.Closed {
+			state = "closed"
+		}
 		results = append(results, Discussion{
 			ID:            n.ID,
 			Number:        n.Number,
@@ -234,6 +247,8 @@ func (c *Client) FetchDiscussions(ctx context.Context, owner, repo, categoryID s
 			CreatedAt:     n.CreatedAt,
 			UpdatedAt:     n.UpdatedAt,
 			URL:           n.URL,
+			Closed:        n.Closed,
+			State:         state,
 			Category:      DiscussionCategory{ID: n.Category.ID, Name: n.Category.Name, Slug: n.Category.Slug},
 			Labels:        labels,
 			CommentsCount: n.Comments.TotalCount,
@@ -279,6 +294,7 @@ func (c *Client) FetchDiscussionComments(ctx context.Context, discussionID strin
 					CreatedAt time.Time `json:"createdAt"`
 					UpdatedAt time.Time `json:"updatedAt"`
 					URL       string    `json:"url"`
+					Closed    bool      `json:"closed"`
 					Author    *struct {
 						Login string `json:"login"`
 					} `json:"author"`

@@ -65,6 +65,7 @@ func TestThreadsView_SlackFeedLayout(t *testing.T) {
 	m.Discussions = []github.Discussion{d1, d2}
 	m.ActiveTab = TabThreads
 	m.ThreadsDeadExpanded = false
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 
 	// 1. Collapsed View: Verify compact line: @simon • ... and indented reply: @alice • ...
 	// AND verify NO repeated "[r]eply" buttons with numbers are shown while browsing!
@@ -156,20 +157,20 @@ func TestThreadsView_SelectionNavigationAndDescending(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d1, d2}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex() // 1 (Thread 1, since 0 is Hot tier header)
 	m.ThreadsSelectedMsgIdx = -1
 
 	// 1. Thread level navigation: 'j' moves cursor down to thread 2
 	updated, _ := m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated
-	if m.ThreadsCursor != 1 {
-		t.Fatalf("expected ThreadsCursor=1, got %d", m.ThreadsCursor)
+	if m.ThreadsCursor != 2 {
+		t.Fatalf("expected ThreadsCursor=2, got %d", m.ThreadsCursor)
 	}
 	// 'k' moves cursor back to thread 1
 	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	m = updated
-	if m.ThreadsCursor != 0 {
-		t.Fatalf("expected ThreadsCursor=0, got %d", m.ThreadsCursor)
+	if m.ThreadsCursor != 1 {
+		t.Fatalf("expected ThreadsCursor=1, got %d", m.ThreadsCursor)
 	}
 
 	// 2. Right arrow on thread 1 OP descends into messages: ThreadsSelectedMsgIdx = 0 (OP)
@@ -199,8 +200,8 @@ func TestThreadsView_SelectionNavigationAndDescending(t *testing.T) {
 	// 5. Down arrow on the LAST message of thread 1 advances to thread 2!
 	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyDown})
 	m = updated
-	if m.ThreadsCursor != 1 {
-		t.Fatalf("expected ThreadsCursor=1 after down on last message, got %d", m.ThreadsCursor)
+	if m.ThreadsCursor != 2 {
+		t.Fatalf("expected ThreadsCursor=2 after down on last message, got %d", m.ThreadsCursor)
 	}
 	if m.ThreadsSelectedMsgIdx != -1 {
 		t.Fatalf("expected ThreadsSelectedMsgIdx=-1 on next thread, got %d", m.ThreadsSelectedMsgIdx)
@@ -209,6 +210,9 @@ func TestThreadsView_SelectionNavigationAndDescending(t *testing.T) {
 	// 6. Navigate back up to thread 1 with 'k', descend into OP, then 'up' ascends to -1
 	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	m = updated
+	if m.ThreadsCursor != 1 {
+		t.Fatalf("expected ThreadsCursor=1, got %d", m.ThreadsCursor)
+	}
 	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRight})
 	m = updated
 	if m.ThreadsSelectedMsgIdx != 0 {
@@ -252,7 +256,7 @@ func TestThreadsView_YankAndContentCopy(t *testing.T) {
 
 	m.Discussions = []github.Discussion{d1}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 	m.ThreadsSelectedMsgIdx = -1
 
 	// 1. Thread level: pressing 'y' extracts all links from thread (OP + replies)
@@ -330,7 +334,7 @@ func TestThreadsView_FocusModeAndTitleEdit(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d1, d2}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 	m.ThreadsSelectedMsgIdx = -1
 
 	// 1. Light grey title rendered in view
@@ -400,7 +404,7 @@ func TestThreadsView_PinnedReplyAndMultiline(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d1, d2}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 1 // Cursor on Thread 2
+	m.ThreadsCursor = 2 // Cursor on Thread 2 (since 0 is Hot header, 1 is Thread 1, 2 is Thread 2)
 
 	// 1. Press 'r' -> start reply pinned to D_2
 	updated, _ := m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
@@ -417,8 +421,8 @@ func TestThreadsView_PinnedReplyAndMultiline(t *testing.T) {
 		m.ThreadsReplyInput.InsertString("\nLine two")
 	}
 
-	// 3. Shift ThreadsCursor to 0 while reply active (simulating cursor or re-order shift)
-	m.ThreadsCursor = 0
+	// 3. Shift ThreadsCursor to 1 while reply active (simulating cursor or re-order shift)
+	m.ThreadsCursor = 1
 
 	// 4. Press Enter -> submit reply. It MUST submit to D_2, not D_1!
 	updated, cmd := m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyEnter})
@@ -647,6 +651,7 @@ func TestThreadsView_ReplyModeRKeyBugFix(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d1}
 	m.ActiveTab = TabThreads
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 
 	// 1. Press 'r' on thread -> drops directly into reply mode
 	updatedModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
@@ -982,7 +987,7 @@ func TestThreadsView_ThreadIndicatorAndMessageUnreadDots(t *testing.T) {
 	m.Discussions = []github.Discussion{d1}
 	m.SortedDiscussions = m.getSortedDiscussions()
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 
 	// Initially neither OP nor comment is marked seen
 	if m.isMessageSeen(d1.ID, d1.Author, d1.CreatedAt, d1.LastReadAt) || m.isMessageSeen(d1.Comments[0].ID, d1.Comments[0].Author, d1.Comments[0].CreatedAt, d1.LastReadAt) {
@@ -1054,7 +1059,7 @@ func TestThreadsView_EditMessageOwnVsOther(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d1}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 	m.ThreadsSelectedMsgIdx = -1
 
 	// 1. Thread level: pressing 'e' on own OP message enters inline edit mode
@@ -1130,7 +1135,7 @@ func TestThreadsView_EditMessageDynamicHeightAndWrapping(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 	m.ThreadsSelectedMsgIdx = -1
 
 	// Press 'e' to start editing
@@ -1200,7 +1205,7 @@ func TestThreadsView_YankLinksModal(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d1}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 	m.ThreadsSelectedMsgIdx = -1
 
 	// 1. Press 'y' -> opens ModalYankLinks with 3 links
@@ -1294,14 +1299,14 @@ func TestThreadsView_TopBarUnreadBadge(t *testing.T) {
 	}
 
 	// View thread 1
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = 1
 	m.markCurrentThreadViewed()
 	if count := m.getUnreadThreadsCount(); count != 1 {
 		t.Fatalf("expected 1 unread thread after viewing first, got %d", count)
 	}
 
 	// View thread 2
-	m.ThreadsCursor = 1
+	m.ThreadsCursor = 2
 	m.markCurrentThreadViewed()
 	if count := m.getUnreadThreadsCount(); count != 0 {
 		t.Fatalf("expected 0 unread threads after viewing both, got %d", count)
@@ -1326,6 +1331,7 @@ func TestThreadsView_QuestionMarkInEditMode(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d}
 	m.ActiveTab = TabThreads
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 
 	// Enter edit mode
 	updated, _ := m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
@@ -1440,7 +1446,7 @@ func TestThreadsView_CollapseThreadWithLeftArrow(t *testing.T) {
 	}
 	m.Discussions = []github.Discussion{d1}
 	m.ActiveTab = TabThreads
-	m.ThreadsCursor = 0
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 	m.ThreadsSelectedMsgIdx = -1
 
 	// 1. Initially unread thread is expanded showing all replies
@@ -1569,6 +1575,7 @@ func TestThreadsView_ReplicateRepoTiersAndHeaderCleanup(t *testing.T) {
 	m.Discussions = []github.Discussion{dHot, dWarm, dCold, dDead}
 	m.ActiveTab = TabThreads
 	m.ThreadsDeadExpanded = false
+	m.ThreadsCursor = m.firstSelectableThreadIndex()
 
 	view := m.renderThreadsView()
 
@@ -1598,8 +1605,8 @@ func TestThreadsView_ReplicateRepoTiersAndHeaderCleanup(t *testing.T) {
 	if strings.Contains(view, "Dead Thread") {
 		t.Errorf("expected Dead Thread to be collapsed by default")
 	}
-	if !strings.Contains(view, "2 Cold / Dead threads collapsed [D to expand]") {
-		t.Errorf("expected collapse prompt for 2 Cold / Dead threads, got:\n%s", view)
+	if !strings.Contains(view, "▶ 🧊 COLD (1 thread)") || !strings.Contains(view, "▶ 💀 DEAD (1 thread)") {
+		t.Errorf("expected collapse headers for Cold and Dead tiers, got:\n%s", view)
 	}
 
 	// 5. Pressing 'D' expands Cold and Dead threads
@@ -1615,5 +1622,115 @@ func TestThreadsView_ReplicateRepoTiersAndHeaderCleanup(t *testing.T) {
 	}
 	if !strings.Contains(viewExpanded, "Dead Thread") {
 		t.Errorf("expected Dead Thread to be visible after expanding with D")
+	}
+}
+
+func TestThreadsView_TierCategoryHeadersAndClosedDiscussions(t *testing.T) {
+	now := time.Now()
+	m := createTestModel()
+	m.AuthUser = "simon"
+	m.Config = &config.Config{ActiveSquad: "platform"}
+
+	dHot := github.Discussion{
+		ID:        "D_HOT_1",
+		Number:    101,
+		Title:     "Hot Topic",
+		Body:      "Hot body",
+		Author:    "alice",
+		CreatedAt: now.Add(-1 * time.Hour),
+		UpdatedAt: now.Add(-1 * time.Hour),
+		Category:  github.DiscussionCategory{Name: "Platform", Slug: "platform"},
+	}
+	dClosed := github.Discussion{
+		ID:        "D_CLOSED_1",
+		Number:    102,
+		Title:     "Closed Thread",
+		Body:      "Closed body",
+		Author:    "bob",
+		CreatedAt: now.Add(-1 * time.Hour),
+		UpdatedAt: now.Add(-1 * time.Hour),
+		Closed:    true, // Immediately placed into Dead tier!
+		Category:  github.DiscussionCategory{Name: "Platform", Slug: "platform"},
+	}
+
+	m.Discussions = []github.Discussion{dHot, dClosed}
+	m.ActiveTab = TabThreads
+	m.ThreadsDeadExpanded = false
+
+	items := m.getThreadFeedItems()
+	// Should have:
+	// item 0: Hot Tier Header (expanded)
+	// item 1: dHot (FeedItemThread)
+	// item 2: Dead Tier Header (collapsed by default)
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items (Hot header, Hot thread, Dead header), got %d: %+v", len(items), items)
+	}
+	if items[0].Kind != FeedItemTierHeader || items[0].Tier != ThreadTierHot || !items[0].Expanded {
+		t.Errorf("expected item 0 to be expanded Hot tier header, got %+v", items[0])
+	}
+	if items[1].Kind != FeedItemThread || items[1].Discussion.Discussion.ID != "D_HOT_1" {
+		t.Errorf("expected item 1 to be Hot thread, got %+v", items[1])
+	}
+	if items[2].Kind != FeedItemTierHeader || items[2].Tier != ThreadTierDead || items[2].Expanded {
+		t.Errorf("expected item 2 to be collapsed Dead tier header, got %+v", items[2])
+	}
+
+	// In rendered view, Hot is open (▼) and Dead is closed (▶)
+	view := m.renderThreadsView()
+	if !strings.Contains(view, "▼ 🔥 HOT (1 thread)") {
+		t.Errorf("expected open Hot header in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "▶ 💀 DEAD (1 thread)") {
+		t.Errorf("expected closed Dead header in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Hot Topic") {
+		t.Errorf("expected Hot Topic visible in view")
+	}
+	if strings.Contains(view, "Closed Thread") {
+		t.Errorf("expected Closed Thread to be hidden under closed Dead header")
+	}
+
+	// 1. Move cursor to Dead Tier Header (index 2) and press Space to toggle expand
+	m.ThreadsCursor = 2
+	updated, _ := m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated
+
+	expandedItems := m.getThreadFeedItems()
+	// Should now have 4 items (Hot header, Hot thread, Dead header, Dead thread)
+	if len(expandedItems) != 4 {
+		t.Fatalf("expected 4 items after expanding Dead header, got %d", len(expandedItems))
+	}
+	expandedView := m.renderThreadsView()
+	if !strings.Contains(expandedView, "▼ 💀 DEAD (1 thread)") {
+		t.Errorf("expected open Dead header in view, got:\n%s", expandedView)
+	}
+	if !strings.Contains(expandedView, "Closed Thread") {
+		t.Errorf("expected Closed Thread visible after expanding Dead header")
+	}
+
+	// 2. Left Arrow: first Left collapses thread replies if expanded; second Left jumps to parent tier header
+	m.ThreadsCursor = 1 // on dHot
+	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyLeft}) // collapses thread
+	m = updated
+	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyLeft}) // jumps to parent tier header
+	m = updated
+	if m.ThreadsCursor != 0 {
+		t.Errorf("expected cursor to jump to parent Hot tier header at index 0, got %d", m.ThreadsCursor)
+	}
+
+	// 3. Test expand all ('E') and collapse all ('Z')
+	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'Z'}})
+	m = updated
+	for _, it := range m.getThreadFeedItems() {
+		if it.Kind == FeedItemThread {
+			t.Errorf("expected NO threads visible when all tiers are collapsed")
+		}
+	}
+
+	updated, _ = m.handleThreadsKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+	m = updated
+	allOpen := m.getThreadFeedItems()
+	if len(allOpen) != 4 {
+		t.Errorf("expected all 4 items visible when all tiers expanded with 'E', got %d", len(allOpen))
 	}
 }

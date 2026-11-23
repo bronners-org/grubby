@@ -265,7 +265,8 @@ func (d *DB) migrate() error {
 		updated_at DATETIME NOT NULL,
 		url TEXT NOT NULL DEFAULT '',
 		comments_count INTEGER NOT NULL DEFAULT 0,
-		last_read_at DATETIME
+		last_read_at DATETIME,
+		closed INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE INDEX IF NOT EXISTS idx_discussions_squad ON discussions (squad, updated_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_discussions_repo ON discussions (repo_owner, repo_name, updated_at DESC);
@@ -299,6 +300,7 @@ func (d *DB) migrate() error {
 	_, _ = d.db.Exec(`ALTER TABLE pull_requests ADD COLUMN repo_full_name TEXT NOT NULL DEFAULT '';`)
 	_, _ = d.db.Exec(`ALTER TABLE pull_requests ADD COLUMN repo_owner TEXT NOT NULL DEFAULT '';`)
 	_, _ = d.db.Exec(`ALTER TABLE tasks ADD COLUMN is_home_repo INTEGER NOT NULL DEFAULT 1;`)
+	_, _ = d.db.Exec(`ALTER TABLE discussions ADD COLUMN closed INTEGER NOT NULL DEFAULT 0;`)
 
 	// Check if repositories table has 'name' as PK instead of 'full_name'
 	var pkName string
