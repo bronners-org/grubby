@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
@@ -45,14 +46,22 @@ func createTestModel() Model {
 	rfi.Placeholder = "Type repository name substring..."
 	rfi.Prompt = "🔍 "
 
+	thCreate := textarea.New()
+	thReply := textarea.New()
+	thEditTitle := textinput.New()
+
 	return Model{
-		ActiveTab:         TabRepos,
-		Config:            cfg,
-		Repos:             repos,
-		SecuritySummaries: secSummaries,
-		GitStatuses:       make(map[string]git.RepoGitStatus),
-		RepoFilterInput:   rfi,
-		SplashDismissed:   true,
+		ActiveTab:             TabRepos,
+		Config:                cfg,
+		Repos:                 repos,
+		SecuritySummaries:     secSummaries,
+		GitStatuses:           make(map[string]git.RepoGitStatus),
+		RepoFilterInput:       rfi,
+		ThreadCreateInput:     thCreate,
+		ThreadsReplyInput:     thReply,
+		ThreadEditTitleInput:  thEditTitle,
+		ThreadsSelectedMsgIdx: -1,
+		SplashDismissed:       true,
 	}
 }
 
@@ -1906,21 +1915,27 @@ func TestTopLevelTabs_WithoutPRTab(t *testing.T) {
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}})
 	m = updated.(Model)
-	if m.ActiveTab != TabSearch {
-		t.Errorf("expected ActiveTab=TabSearch on '4', got %v", m.ActiveTab)
+	if m.ActiveTab != TabThreads {
+		t.Errorf("expected ActiveTab=TabThreads on '4', got %v", m.ActiveTab)
 	}
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
 	m = updated.(Model)
-	if m.ActiveTab != TabStatus {
-		t.Errorf("expected ActiveTab=TabStatus on '5', got %v", m.ActiveTab)
+	if m.ActiveTab != TabSearch {
+		t.Errorf("expected ActiveTab=TabSearch on '5', got %v", m.ActiveTab)
 	}
 
-	// 3. Test Tab cycling (modulo 5)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'6'}})
+	m = updated.(Model)
+	if m.ActiveTab != TabStatus {
+		t.Errorf("expected ActiveTab=TabStatus on '6', got %v", m.ActiveTab)
+	}
+
+	// 3. Test Tab cycling (modulo 6)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	m = updated.(Model)
 	if m.ActiveTab != TabRepos {
-		t.Errorf("expected TabRepos after cycling from 5, got %v", m.ActiveTab)
+		t.Errorf("expected TabRepos after cycling from 6, got %v", m.ActiveTab)
 	}
 }
 

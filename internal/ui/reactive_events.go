@@ -39,6 +39,8 @@ func (m Model) handleEntityEvent(env protocol.EventEnvelope) (Model, tea.Cmd) {
 		return m.patchTask(env)
 	case protocol.EntitySquadActivity:
 		return m.patchSquadActivity(env)
+	case protocol.EntityDiscussion:
+		return m.patchDiscussion(env)
 	default:
 		return m, nil
 	}
@@ -341,5 +343,104 @@ func (m Model) patchSquadActivity(env protocol.EventEnvelope) (Model, tea.Cmd) {
 
 	m.StatusMsg = fmt.Sprintf("⚡ [Activity] %s: %s on %s", evt.Actor, evt.Action, evt.Repo)
 	m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+	return m, nil
+}
+
+func (m Model) patchDiscussion(env protocol.EventEnvelope) (Model, tea.Cmd) {
+	var payload protocol.DiscussionPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return m, nil
+	}
+
+	disc := payload.Discussion
+	if disc.ID == "" {
+		return m, nil
+	}
+
+	if payload.Comment != nil {
+		cm := *payload.Comment
+		if m.DiscussionComments == nil {
+			m.DiscussionComments = make(map[string][]github.DiscussionComment)
+		}
+		existing := m.DiscussionComments[disc.ID]
+		foundCm := false
+		for i, c := range existing {
+			if c.ID == cm.ID {
+				existing[i] = cm
+				foundCm = true
+				break
+			}
+		}
+		if !foundCm {
+			existing = append(existing, cm)
+		}
+		m.DiscussionComments[disc.ID] = existing
+
+		foundDisc := false
+		for i, d := range m.Discussions {
+			if d.ID == disc.ID {
+				m.Discussions[i].UpdatedAt = cm.CreatedAt
+				m.Discussions[i].CommentsCount = len(existing)
+				foundDisc = true
+				break
+			}
+		}
+		if !foundDisc {
+			disc.CommentsCount = len(existing)
+			m.Discussions = append([]github.Discussion{disc}, m.Discussions...)
+		}
+
+		m.recordEntityFlash("discussion:" + disc.ID)
+		m.StatusMsg = fmt.Sprintf("⚡ [Thread] Reply on #%d by @%s", disc.Number, cm.Author)
+		m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+
+		if m.AuthUser != "" && !strings.EqualFold(cm.Author, m.AuthUser) {
+			if strings.Contains(strings.ToLower(cm.Body), "@"+strings.ToLower(m.AuthUser)) {
+				SendNativeNotification("Grubby Thread Mention", fmt.Sprintf("@%s in #%d: %s", cm.Author, disc.Number, disc.Title), cm.Body)
+			}
+		}
+		return m, nil
+	}
+
+	switch env.Action {
+	case protocol.ActionDeleted:
+		var updated []github.Discussion
+		for _, d := range m.Discussions {
+			if d.ID == disc.ID {
+				continue
+			}
+			updated = append(updated, d)
+		}
+		m.Discussions = updated
+		delete(m.DiscussionComments, disc.ID)
+		m.StatusMsg = fmt.Sprintf("⚡ [Thread] #%d deleted", disc.Number)
+		m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+
+	case protocol.ActionCreated, protocol.ActionUpdated:
+		found := false
+		for i, d := range m.Discussions {
+			if d.ID == disc.ID {
+				m.Discussions[i] = disc
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.Discussions = append([]github.Discussion{disc}, m.Discussions...)
+		}
+		m.recordEntityFlash("discussion:" + disc.ID)
+		actionWord := "updated"
+		if env.Action == protocol.ActionCreated {
+			actionWord = "started"
+			if m.AuthUser != "" && !strings.EqualFold(disc.Author, m.AuthUser) {
+				if strings.Contains(strings.ToLower(disc.Body), "@"+strings.ToLower(m.AuthUser)) {
+					SendNativeNotification("Grubby Thread Mention", fmt.Sprintf("@%s started #%d: %s", disc.Author, disc.Number, disc.Title), disc.Body)
+				}
+			}
+		}
+		m.StatusMsg = fmt.Sprintf("⚡ [Thread] #%d %s by @%s", disc.Number, actionWord, disc.Author)
+		m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+	}
+
 	return m, nil
 }

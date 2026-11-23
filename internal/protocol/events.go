@@ -18,6 +18,7 @@ const (
 	EntitySecurityAlert EntityType = "security_alert"
 	EntityOrgMember     EntityType = "org_member"
 	EntitySyncState     EntityType = "sync_state"
+	EntityDiscussion    EntityType = "discussion"
 )
 
 type ActionType string
@@ -57,6 +58,11 @@ type SquadActivityPayload struct {
 
 type SecurityAlertPayload struct {
 	Alert github.SecurityAlertSummary `json:"alert"`
+}
+
+type DiscussionPayload struct {
+	Discussion github.Discussion         `json:"discussion"`
+	Comment    *github.DiscussionComment `json:"comment,omitempty"`
 }
 
 type SyncStatePayload struct {
@@ -148,6 +154,21 @@ func NewSyncStateEvent(org, status, msg string, count int64) (EventEnvelope, err
 		Org:       org,
 		Entity:    EntitySyncState,
 		Action:    ActionUpdated,
+		Timestamp: time.Now(),
+		Payload:   data,
+	}, nil
+}
+
+func NewDiscussionEvent(action ActionType, disc github.Discussion, comment *github.DiscussionComment) (EventEnvelope, error) {
+	data, err := json.Marshal(DiscussionPayload{Discussion: disc, Comment: comment})
+	if err != nil {
+		return EventEnvelope{}, err
+	}
+	return EventEnvelope{
+		ID:        fmt.Sprintf("disc-%s-%d", disc.ID, time.Now().UnixNano()),
+		Org:       disc.RepoOwner,
+		Entity:    EntityDiscussion,
+		Action:    action,
 		Timestamp: time.Now(),
 		Payload:   data,
 	}, nil

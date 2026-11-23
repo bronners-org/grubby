@@ -32,6 +32,7 @@ const (
 	TabRepos TabType = iota
 	TabTasks
 	TabSquad
+	TabThreads
 	TabSearch
 	TabStatus
 
@@ -88,11 +89,24 @@ const (
 	ModalCompletedTasks
 	ModalCreatePRTask
 	ModalAssignSquadTask
+	ModalCreateThread
+	ModalReplyThread
+	ModalEditThreadTitle
+	ModalEditMessage
+	ModalYankLinks
 
 	// Aliases for Labels
 	ModalFilterLabel  = ModalFilterGroup
 	ModalManageLabels = ModalManageGroups
 )
+
+type AutocompleteItem struct {
+	Key         string
+	Title       string
+	Description string
+	InsertText  string
+	URL         string
+}
 
 type SplashDoneMsg struct{}
 
@@ -191,6 +205,14 @@ type TaskAssigneesUpdatedMsg struct {
 	TaskID    int64
 	Assignees []string
 	Err       error
+}
+
+type DiscussionsLoadedMsg struct {
+	Discussions  []github.Discussion
+	Categories   []github.DiscussionCategory
+	RepositoryID string
+	Comments     map[string][]github.DiscussionComment
+	Err          error
 }
 
 type GitHubStatusLoadedMsg struct {
@@ -391,6 +413,44 @@ type Model struct {
 	SelectedRepoGroups map[string]bool // groupName -> inGroup
 	RepoTabsYankLeader bool            // true when in yank leader mode for repo tabs modal
 
+	// Threads & Discussions
+	Discussions                 []github.Discussion
+	DiscussionComments          map[string][]github.DiscussionComment
+	DiscussionCategories        []github.DiscussionCategory
+	RepositoryID                string
+	ThreadsCursor               int
+	ThreadsExpandedID           string
+	ThreadsCollapsedIDs         map[string]bool
+	ThreadsReplyActive          bool
+	ThreadsReplyDiscussionID    string
+	ThreadsReplyInput           textarea.Model
+	ThreadCreateInput           textarea.Model
+	ThreadEditTitleInput        textinput.Model
+	ThreadsEditActive           bool
+	ThreadEditMessageInput      textarea.Model
+	ThreadEditMessageID         string
+	ThreadEditDiscID            string
+	ThreadEditIsOP              bool
+	ThreadEditMessageAuthor     string
+	ThreadsSelectedMsgIdx       int // -1 = thread selection level; 0 = OP; 1..N = replies
+	ThreadsYankActive           bool
+	ThreadsYankScope            string // "thread" or "message"
+	ThreadsYankItems            []YankableItem
+	ThreadsYankCursor           int
+	SeenMessages                map[string]bool
+	ThreadsFocused              bool
+	SortedDiscussions           []ScoredDiscussion
+	LastThreadsSort             time.Time
+	ThreadsDeadExpanded         bool
+	LastDiscussionsSync         time.Time
+
+	// Autocomplete for message inputs
+	AutocompleteActive  bool
+	AutocompleteTrigger rune
+	AutocompleteQuery   string
+	AutocompleteCursor  int
+	AutocompleteItems   []AutocompleteItem
+
 	// Layout
 	Width  int
 	Height int
@@ -452,6 +512,29 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 	tni.SetHeight(8)
 	tni.SetWidth(65)
 
+	thCreate := textarea.New()
+	thCreate.Placeholder = "What's on your mind? (@ for squad members, # for repos/PRs, Ctrl+S to post)..."
+	thCreate.ShowLineNumbers = false
+	thCreate.SetHeight(5)
+	thCreate.SetWidth(70)
+
+	thReply := textarea.New()
+	thReply.Placeholder = "Write a reply... (@ for squad, # for repos/PRs, Enter to send, Shift+Enter for newline, Esc to cancel)"
+	thReply.ShowLineNumbers = false
+	thReply.SetHeight(3)
+
+	thEditTitle := textinput.New()
+	thEditTitle.Placeholder = "New thread title (Enter to save, Esc to cancel)..."
+	thEditTitle.Prompt = "Title: "
+	thEditTitle.CharLimit = 150
+	thEditTitle.Width = 60
+
+	thEditMsg := textarea.New()
+	thEditMsg.Placeholder = "Edit message (Shift+Enter for newline, Enter/Ctrl+S to save)..."
+	thEditMsg.ShowLineNumbers = false
+	thEditMsg.SetHeight(8)
+	thEditMsg.SetWidth(70)
+
 	vp := viewport.New(60, 20)
 
 	sp := spinner.New()
@@ -508,6 +591,20 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 		EntityFlashUpdates:    make(map[string]time.Time),
 		TaskCollapseCompleted: true,
 		ExpandedRepoPRs:       make(map[string]bool),
+		DiscussionComments:   make(map[string][]github.DiscussionComment),
+		ThreadCreateInput:    thCreate,
+		ThreadsReplyInput:    thReply,
+		ThreadEditTitleInput: thEditTitle,
+		ThreadEditMessageInput: thEditMsg,
+		ThreadsSelectedMsgIdx: -1,
+		ThreadsCollapsedIDs:   make(map[string]bool),
+		SeenMessages:         make(map[string]bool),
+	}
+
+	if db != nil {
+		if seen, err := db.GetSeenMessageIDs(); err == nil && len(seen) > 0 {
+			m.SeenMessages = seen
+		}
 	}
 
 	if cfg != nil {
@@ -598,6 +695,14 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 					m.ProfileCache[strings.ToLower(mem.Login)] = mem
 				}
 			}
+			if cachedDiscs, err := db.GetDiscussions(cfg.ActiveSquad); err == nil && len(cachedDiscs) > 0 {
+				m.Discussions = cachedDiscs
+				for _, d := range cachedDiscs {
+					if cms, err := db.GetDiscussionComments(d.ID); err == nil && len(cms) > 0 {
+						m.DiscussionComments[d.ID] = cms
+					}
+				}
+			}
 			if sec, err := db.GetSecuritySummaries(); err == nil {
 				m.SecuritySummaries = sec
 			}
@@ -663,6 +768,7 @@ func (m Model) isEntityFlashing(key string) (bool, lipgloss.Color) {
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		m.loadDataCmd(),
+		m.loadDiscussionsCmd(),
 		m.fetchGitHubStatusCmd(),
 		textinput.Blink,
 		m.Spinner.Tick,
@@ -686,6 +792,65 @@ func (m Model) fetchGitHubStatusCmd() tea.Cmd {
 		return GitHubStatusLoadedMsg{
 			Summary: summary,
 			Err:     err,
+		}
+	}
+}
+
+func (m Model) loadDiscussionsCmd() tea.Cmd {
+	return func() tea.Msg {
+		if m.GHClient == nil || m.Config == nil {
+			return DiscussionsLoadedMsg{}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		homeOrg := m.Config.HomeOrg
+		if homeOrg == "" {
+			homeOrg = m.CurrentOrg
+		}
+		owner, repo := m.Config.GetCentralTasksRepo(homeOrg)
+		if owner == "" || repo == "" {
+			return DiscussionsLoadedMsg{}
+		}
+
+		// Ensure discussions are enabled on the tasks repository
+		_, _ = m.GHClient.EnsureDiscussionsEnabled(ctx, owner, repo)
+
+		repoID, cats, _ := m.GHClient.GetDiscussionCategories(ctx, owner, repo)
+
+		discs, err := m.GHClient.FetchDiscussions(ctx, owner, repo, "", 50)
+		if err != nil {
+			if m.DB != nil {
+				cached, dbErr := m.DB.GetDiscussions(m.Config.ActiveSquad)
+				if dbErr == nil && len(cached) > 0 {
+					return DiscussionsLoadedMsg{Discussions: cached, Categories: cats, RepositoryID: repoID}
+				}
+			}
+			return DiscussionsLoadedMsg{Err: err}
+		}
+
+		if m.DB != nil {
+			_ = m.DB.SaveDiscussions(discs, m.Config.ActiveSquad)
+		}
+
+		comments := make(map[string][]github.DiscussionComment)
+		for _, d := range discs {
+			if len(d.Comments) > 0 {
+				comments[d.ID] = d.Comments
+			} else if m.DB != nil {
+				cms, _ := m.DB.GetDiscussionComments(d.ID)
+				if len(cms) > 0 {
+					comments[d.ID] = cms
+				}
+			}
+		}
+
+		return DiscussionsLoadedMsg{
+			Discussions:  discs,
+			Categories:   cats,
+			RepositoryID: repoID,
+			Comments:     comments,
 		}
 	}
 }
@@ -1346,6 +1511,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.fetchGitHubStatusCmd())
 		}
 
+		// Poll discussions every 30 seconds
+		if time.Since(m.LastDiscussionsSync) >= 30*time.Second && m.GHClient != nil {
+			m.LastDiscussionsSync = time.Now()
+			cmds = append(cmds, m.loadDiscussionsCmd())
+		}
+
+		// Recalculate discussion sorting every 5 minutes async
+		if m.LastThreadsSort.IsZero() || time.Since(m.LastThreadsSort) >= 5*time.Minute {
+			m.recalculateDiscussionOrder()
+		}
+
 		// Auto-refresh main GitHub data every 5 minutes ONLY when webhooks are not active
 		if m.EventSub == nil && time.Since(m.LastRefreshTime) >= 5*time.Minute && !m.Loading {
 			m.Loading = true
@@ -1425,6 +1601,159 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.PrevComponentStatuses[comp.Name] = comp.Status
 			}
 		}
+		return m, nil
+
+	case DiscussionsLoadedMsg:
+		if msg.Err == nil {
+			if len(msg.Discussions) > 0 {
+				m.Discussions = msg.Discussions
+			}
+			if len(msg.Categories) > 0 {
+				m.DiscussionCategories = msg.Categories
+			}
+			if msg.RepositoryID != "" {
+				m.RepositoryID = msg.RepositoryID
+			}
+			if msg.Comments != nil {
+				if m.DiscussionComments == nil {
+					m.DiscussionComments = make(map[string][]github.DiscussionComment)
+				}
+				for k, v := range msg.Comments {
+					m.DiscussionComments[k] = v
+				}
+			}
+			if m.DB != nil {
+				if seen, err := m.DB.GetSeenMessageIDs(); err == nil && len(seen) > 0 {
+					m.SeenMessages = seen
+				}
+			}
+			if len(m.SortedDiscussions) == 0 || time.Since(m.LastThreadsSort) >= 5*time.Minute {
+				m.recalculateDiscussionOrder()
+			}
+		}
+		return m, nil
+
+	case ThreadCreatedMsg:
+		m.Discussions = append([]github.Discussion{msg.Discussion}, m.Discussions...)
+		if m.DB != nil && m.Config != nil {
+			_ = m.DB.SaveDiscussion(msg.Discussion, m.Config.ActiveSquad)
+		}
+		m.markMessagesSeen([]string{msg.Discussion.ID}, msg.Discussion.ID)
+		m.recalculateDiscussionOrder()
+		m.ThreadsCursor = 0
+		m.StatusMsg = fmt.Sprintf("✓ Started thread #%d: %s", msg.Discussion.Number, msg.Discussion.Title)
+		m.StatusMsgTimer = time.Now().Add(4 * time.Second)
+		return m, nil
+
+	case ThreadReplyCreatedMsg:
+		if m.DiscussionComments == nil {
+			m.DiscussionComments = make(map[string][]github.DiscussionComment)
+		}
+		m.DiscussionComments[msg.DiscussionID] = append(m.DiscussionComments[msg.DiscussionID], msg.Comment)
+		for i, d := range m.Discussions {
+			if d.ID == msg.DiscussionID {
+				m.Discussions[i].UpdatedAt = msg.Comment.CreatedAt
+				m.Discussions[i].CommentsCount = len(m.DiscussionComments[msg.DiscussionID])
+				break
+			}
+		}
+		for i := range m.SortedDiscussions {
+			if m.SortedDiscussions[i].Discussion.ID == msg.DiscussionID {
+				m.SortedDiscussions[i].Discussion.UpdatedAt = msg.Comment.CreatedAt
+				m.SortedDiscussions[i].Discussion.CommentsCount = len(m.DiscussionComments[msg.DiscussionID])
+				m.SortedDiscussions[i].Discussion.Comments = m.DiscussionComments[msg.DiscussionID]
+				break
+			}
+		}
+		if m.DB != nil {
+			_ = m.DB.SaveDiscussionComment(msg.Comment)
+		}
+		m.markMessagesSeen([]string{msg.Comment.ID}, msg.DiscussionID)
+		m.StatusMsg = fmt.Sprintf("✓ Posted reply to thread")
+		m.StatusMsgTimer = time.Now().Add(4 * time.Second)
+		return m, nil
+
+	case ThreadTitleUpdatedMsg:
+		for i := range m.Discussions {
+			if m.Discussions[i].ID == msg.DiscussionID {
+				m.Discussions[i].Title = msg.Title
+				if m.DB != nil && m.Config != nil {
+					_ = m.DB.SaveDiscussion(m.Discussions[i], m.Config.ActiveSquad)
+				}
+				break
+			}
+		}
+		for i := range m.SortedDiscussions {
+			if m.SortedDiscussions[i].Discussion.ID == msg.DiscussionID {
+				m.SortedDiscussions[i].Discussion.Title = msg.Title
+				break
+			}
+		}
+		m.StatusMsg = fmt.Sprintf("✓ Updated title: %s", msg.Title)
+		m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+		return m, nil
+
+	case ThreadMessageUpdatedMsg:
+		if msg.IsOP {
+			for i := range m.Discussions {
+				if m.Discussions[i].ID == msg.DiscID {
+					m.Discussions[i].Body = msg.Body
+					m.Discussions[i].UpdatedAt = msg.UpdatedAt
+					if m.DB != nil && m.Config != nil {
+						_ = m.DB.SaveDiscussion(m.Discussions[i], m.Config.ActiveSquad)
+					}
+					break
+				}
+			}
+			for i := range m.SortedDiscussions {
+				if m.SortedDiscussions[i].Discussion.ID == msg.DiscID {
+					m.SortedDiscussions[i].Discussion.Body = msg.Body
+					m.SortedDiscussions[i].Discussion.UpdatedAt = msg.UpdatedAt
+					break
+				}
+			}
+		} else {
+			if cms, ok := m.DiscussionComments[msg.DiscID]; ok {
+				for i := range cms {
+					if cms[i].ID == msg.MessageID {
+						cms[i].Body = msg.Body
+						cms[i].UpdatedAt = msg.UpdatedAt
+						break
+					}
+				}
+				m.DiscussionComments[msg.DiscID] = cms
+			}
+			for i := range m.Discussions {
+				if m.Discussions[i].ID == msg.DiscID {
+					for j := range m.Discussions[i].Comments {
+						if m.Discussions[i].Comments[j].ID == msg.MessageID {
+							m.Discussions[i].Comments[j].Body = msg.Body
+							m.Discussions[i].Comments[j].UpdatedAt = msg.UpdatedAt
+							if m.DB != nil {
+								_ = m.DB.SaveDiscussionComment(m.Discussions[i].Comments[j])
+							}
+							break
+						}
+					}
+					break
+				}
+			}
+			for i := range m.SortedDiscussions {
+				if m.SortedDiscussions[i].Discussion.ID == msg.DiscID {
+					for j := range m.SortedDiscussions[i].Discussion.Comments {
+						if m.SortedDiscussions[i].Discussion.Comments[j].ID == msg.MessageID {
+							m.SortedDiscussions[i].Discussion.Comments[j].Body = msg.Body
+							m.SortedDiscussions[i].Discussion.Comments[j].UpdatedAt = msg.UpdatedAt
+							break
+						}
+					}
+					break
+				}
+			}
+		}
+		m.recalculateDiscussionOrder()
+		m.StatusMsg = "✓ Message updated successfully"
+		m.StatusMsgTimer = time.Now().Add(3 * time.Second)
 		return m, nil
 
 	case SingleRepoLoadedMsg:
@@ -2107,6 +2436,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleReposKeys(msg)
 		}
 
+		// When in threads tab and typing in reply or in yank mode, route keystrokes directly to threads keys
+		if m.ActiveTab == TabThreads && (m.ThreadsReplyActive || m.ThreadsYankActive) {
+			return m.handleThreadsKeys(msg)
+		}
+
 		// Global Key Handling (only active when not typing in an input field)
 		switch msg.String() {
 		case "ctrl+c":
@@ -2123,25 +2457,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ActiveTab = TabSquad
 			return m, m.emitSquadMemberAvatarsCmd()
 		case "4":
+			m.ActiveTab = TabThreads
+			m.markCurrentThreadViewed()
+			return m, nil
+		case "5":
 			m.ActiveTab = TabSearch
 			return m, nil
-		case "5", "6", "7":
+		case "6", "7":
 			m.ActiveTab = TabStatus
 			return m, nil
 		case "tab":
-			m.ActiveTab = (m.ActiveTab + 1) % 5
+			m.ActiveTab = (m.ActiveTab + 1) % 6
 			if m.ActiveTab == TabSquad {
 				return m, m.emitSquadMemberAvatarsCmd()
+			}
+			if m.ActiveTab == TabThreads {
+				m.markCurrentThreadViewed()
 			}
 			return m, nil
 		case "shift+tab":
-			m.ActiveTab = (m.ActiveTab + 4) % 5
+			m.ActiveTab = (m.ActiveTab + 5) % 6
 			if m.ActiveTab == TabSquad {
 				return m, m.emitSquadMemberAvatarsCmd()
 			}
-			return m, nil
-		case "?":
-			m.ActiveModal = ModalHelp
+			if m.ActiveTab == TabThreads {
+				m.markCurrentThreadViewed()
+			}
 			return m, nil
 		case "r":
 			if m.ActiveTab == TabRepos {
@@ -2150,12 +2491,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ActiveTab == TabStatus {
 				return m.handleStatusKeys(msg)
 			}
+			if m.ActiveTab == TabThreads {
+				return m.handleThreadsKeys(msg)
+			}
 			m.Loading = true
 			m.LastRefreshTime = time.Now()
 			m.LastStatusCheck = time.Now()
 			m.StatusMsg = "Refreshing data from GitHub..."
 			m.StatusMsgTimer = time.Now().Add(5 * time.Second)
 			return m, tea.Batch(m.loadDataCmd(), m.fetchGitHubStatusCmd(), m.Spinner.Tick)
+		case "R":
+			if m.ActiveTab == TabThreads {
+				m.LastDiscussionsSync = time.Now()
+				m.StatusMsg = "Refreshing threads from GitHub..."
+				m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+				return m, tea.Batch(m.loadDiscussionsCmd(), m.Spinner.Tick)
+			}
 		}
 
 		// Tab-Specific Key Handling
@@ -2166,6 +2517,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleTasksKeys(msg)
 		case TabSquad:
 			return m.handleSquadKeys(msg)
+		case TabThreads:
+			return m.handleThreadsKeys(msg)
 		case TabSearch:
 			return m.handleSearchKeys(msg)
 		case TabStatus:
@@ -2206,6 +2559,8 @@ func (m Model) View() string {
 		body = m.renderTasksView()
 	case TabSquad:
 		body = m.renderSquadView()
+	case TabThreads:
+		body = m.renderThreadsView()
 	case TabSearch:
 		body = m.renderSearchView()
 	case TabStatus:
@@ -2258,14 +2613,21 @@ func (m Model) renderTopBar() string {
 	squadOpen := len(m.SquadTasks)
 	totalTasks := mineOpen + squadOpen
 
+	unreadThreads := m.getUnreadThreadsCount()
+	threadsBadge := ""
+	if unreadThreads > 0 {
+		threadsBadge = fmt.Sprintf(" (%d)", unreadThreads)
+	}
+
 	var tabs []string
-	if m.Width >= 120 {
+	if m.Width >= 135 {
 		tabs = []string{
 			"1: Repositories",
 			fmt.Sprintf("2: Tasks (%d)", totalTasks),
 			"3: Squad Activity",
-			"4: Code Search",
-			fmt.Sprintf("5: Status %s", statusDot),
+			fmt.Sprintf("4: Threads%s", threadsBadge),
+			"5: Code Search",
+			fmt.Sprintf("6: Status %s", statusDot),
 		}
 	} else if m.Width >= 95 {
 		tasksCountStr := ""
@@ -2276,12 +2638,13 @@ func (m Model) renderTopBar() string {
 			"1: Repos",
 			fmt.Sprintf("2: Tasks%s", tasksCountStr),
 			"3: Squad",
-			"4: Search",
-			fmt.Sprintf("5: Status %s", statusDot),
+			fmt.Sprintf("4: Threads%s", threadsBadge),
+			"5: Search",
+			fmt.Sprintf("6: Status %s", statusDot),
 		}
 	} else {
 		tabs = []string{
-			"1: Repos", "2: Tasks", "3: Squad", "4: Search", fmt.Sprintf("5: %s", statusDot),
+			"1: Repos", "2: Tasks", "3: Squad", fmt.Sprintf("4: Thr%s", threadsBadge), "5: Search", fmt.Sprintf("6: %s", statusDot),
 		}
 	}
 
@@ -2437,13 +2800,13 @@ func (m Model) renderFooter() string {
 			}
 
 			if isTierHeader {
-				help = "[Space/Enter] Toggle Tier  [Left/h] Collapse  [Right/l] Expand  [Z] Collapse All  [E] Expand All  [j/k] Navigate  [?] Help"
+				help = "[Space/Enter] Toggle Tier  [Left/h] Collapse  [Right/l] Expand  [Z] Collapse All  [E] Expand All  [j/k] Navigate"
 			} else if isPRItem {
-				help = "[Enter/o] Open PR  [m] Merge  [p] Copilot  [k/c] Checkout  [s] Session  [t] Task  [y] Yank  [r] Refresh  [Left/h] Parent  [C] Claim  [?] Help"
+				help = "[Enter/o] Open PR  [m] Merge  [p] Copilot  [k/c] Checkout  [s] Session  [t] Task  [y] Yank  [r] Refresh  [Left/h] Parent  [C] Claim"
 			} else if m.RepoFilter != "" || m.RepoGroupFilter != "" || m.RepoSortMode != RepoSortDefault || m.RepoSortVulnerabilities || m.SquadFilterActive {
-				help = "[Enter] Toggle PRs  [s] Session  [r] Refresh  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [Esc] Clear  [?] Help"
+				help = "[Enter] Toggle PRs  [s] Session  [r] Refresh  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [Esc] Clear"
 			} else {
-				help = "[Enter] Toggle PRs  [s] Session  [r] Refresh  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label  [?] Help"
+				help = "[Enter] Toggle PRs  [s] Session  [r] Refresh  [S] Sort (v/p/l)  [f] Filter (n/l/s)  [o] Open  [y] Yank  [C] Claim  [c] Clone  [l] Label"
 			}
 		}
 	case TabTasks:
@@ -2458,17 +2821,29 @@ func (m Model) renderFooter() string {
 		} else {
 			_, cursorTask := m.getCursorTarget()
 			if cursorTask != nil && cursorTask.IsPRReview() {
-				help = "[a] Add Task (s/m)  [g] Go to (#/f/l)  [Enter/o] Open PR  [Space] Done  [D] Toggle Done Sec  [n] Notes  [p] Priority  [c/A] Assign  [d] All Done  [?] Help"
+				help = "[a] Add Task (s/m)  [g] Go to (#/f/l)  [Enter/o] Open PR  [Space] Done  [D] Toggle Done Sec  [n] Notes  [p] Priority  [c/A] Assign  [d] All Done"
 			} else {
-				help = "[a] Add Task (s/m)  [g] Go to (#/f/l)  [Enter] Edit Title  [Space] Done  [D] Toggle Done Sec  [n] Notes  [p] Priority  [c/A] Assign  [d] All Done  [?] Help"
+				help = "[a] Add Task (s/m)  [g] Go to (#/f/l)  [Enter] Edit Title  [Space] Done  [D] Toggle Done Sec  [n] Notes  [p] Priority  [c/A] Assign  [d] All Done"
 			}
 		}
 	case TabSquad:
-		help = "[m] Manage Squad  [s] Switch Squad  [n] New Squad  [r] Refresh  [?] Help"
+		help = "[m] Manage Squad  [s] Switch Squad  [n] New Squad  [r] Refresh"
+	case TabThreads:
+		if m.ThreadsReplyActive {
+			help = "[Enter] Send Reply  [Shift+Enter] Line Break  [@] Squad  [#] Refs  [Esc] Cancel"
+		} else if m.ThreadsYankActive {
+			help = "Yank Link: [1..9] Copy link to clipboard  [Esc] Cancel"
+		} else if m.ThreadsSelectedMsgIdx >= 0 {
+			help = "Message Nav: [j/k] Select Msg  [c] Yank Content  [y] Yank Links  [r] Reply  [←/h/Esc] Back to Threads"
+		} else if m.ThreadsFocused {
+			help = "Focused: [f/Esc] Exit Focus  [→/l] Select Messages  [r] Reply  [t] Title  [y] Yank Links"
+		} else {
+			help = "[c] New Thread  [→/l] Select Messages  [r] Reply  [t] Title  [f] Focus  [y] Yank Links  [R] Refresh"
+		}
 	case TabSearch:
-		help = "[/] Query  [j/k] Nodes  [h/l/Space] Toggle  [Tab] Switch Viewport  [Enter] Open Editor  [?] Help"
+		help = "[/] Query  [j/k] Nodes  [h/l/Space] Toggle  [Tab] Switch Viewport  [Enter] Open Editor"
 	case TabStatus:
-		help = "[r] Refresh Status  [o / Enter] Statuspage  [j/k] Navigate  [?] Help  [q] Quit"
+		help = "[r] Refresh Status  [o / Enter] Statuspage  [j/k] Navigate  [q] Quit"
 	}
 
 	toast := ""
@@ -2938,4 +3313,127 @@ func (m Model) syncSquadsFileCmd() tea.Cmd {
 		return nil
 	}
 }
+
+// isMessageSeen returns whether a message (OP or reply) has been seen by the user.
+func (m Model) isMessageSeen(msgID string, author string, createdAt time.Time, discLastRead time.Time) bool {
+	if m.AuthUser != "" && strings.EqualFold(author, m.AuthUser) {
+		return true // Author's own message is always considered seen
+	}
+	if len(m.SeenMessages) > 0 && m.SeenMessages[msgID] {
+		return true
+	}
+	if !discLastRead.IsZero() && !createdAt.After(discLastRead) {
+		return true
+	}
+	return false
+}
+
+// markMessagesSeen records message IDs as seen in memory and in the SQLite database.
+func (m *Model) markMessagesSeen(messageIDs []string, discussionID string) {
+	if m.SeenMessages == nil {
+		m.SeenMessages = make(map[string]bool)
+	}
+	var newSeen []string
+	for _, id := range messageIDs {
+		if id != "" && !m.SeenMessages[id] {
+			m.SeenMessages[id] = true
+			newSeen = append(newSeen, id)
+		}
+	}
+	if m.DB != nil && len(newSeen) > 0 {
+		_ = m.DB.MarkMessagesSeen(newSeen, discussionID)
+	}
+	if discussionID != "" {
+		now := time.Now()
+		for i := range m.Discussions {
+			if m.Discussions[i].ID == discussionID {
+				m.Discussions[i].LastReadAt = now
+				break
+			}
+		}
+		for i := range m.SortedDiscussions {
+			if m.SortedDiscussions[i].Discussion.ID == discussionID {
+				m.SortedDiscussions[i].Discussion.LastReadAt = now
+				m.SortedDiscussions[i].IsUnread = false
+				break
+			}
+		}
+	}
+}
+
+// isDiscussionUnread checks if any message in the discussion has not been seen.
+func (m Model) isDiscussionUnread(disc github.Discussion) bool {
+	comments := m.DiscussionComments[disc.ID]
+	if len(comments) == 0 {
+		comments = disc.Comments
+	}
+	if !m.isMessageSeen(disc.ID, disc.Author, disc.CreatedAt, disc.LastReadAt) {
+		return true
+	}
+	for _, cm := range comments {
+		if !m.isMessageSeen(cm.ID, cm.Author, cm.CreatedAt, disc.LastReadAt) {
+			return true
+		}
+	}
+	return false
+}
+
+// markCurrentThreadViewed marks all currently rendered messages of the active thread as seen.
+// isThreadExpanded returns true if the discussion should show all replies.
+// Threads are expanded if:
+// 1. Not explicitly collapsed in ThreadsCollapsedIDs, AND
+// 2. Either focused, explicitly expanded via ThreadsExpandedID, or containing unread messages.
+func (m Model) isThreadExpanded(discID string, hasUnread bool) bool {
+	if m.ThreadsCollapsedIDs != nil && m.ThreadsCollapsedIDs[discID] {
+		return false
+	}
+	if m.ThreadsFocused {
+		return true
+	}
+	if m.ThreadsExpandedID == discID {
+		return true
+	}
+	if hasUnread {
+		return true
+	}
+	return false
+}
+
+func (m *Model) markCurrentThreadViewed() {
+	disc := m.getSelectedDiscussion()
+	if disc == nil {
+		return
+	}
+	comments := m.DiscussionComments[disc.ID]
+	if len(comments) == 0 {
+		comments = disc.Comments
+	}
+
+	var msgIDs []string
+	msgIDs = append(msgIDs, disc.ID)
+
+	hasUnread := m.isDiscussionUnread(*disc)
+	isExpanded := m.isThreadExpanded(disc.ID, hasUnread)
+	if isExpanded {
+		for _, cm := range comments {
+			msgIDs = append(msgIDs, cm.ID)
+		}
+	} else if len(comments) > 0 {
+		msgIDs = append(msgIDs, comments[len(comments)-1].ID)
+	}
+
+	m.markMessagesSeen(msgIDs, disc.ID)
+}
+
+func (m Model) getUnreadThreadsCount() int {
+	count := 0
+	sorted := m.getSortedDiscussions()
+	for _, sd := range sorted {
+		if m.isDiscussionUnread(sd.Discussion) {
+			count++
+		}
+	}
+	return count
+}
+
 

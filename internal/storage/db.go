@@ -248,6 +248,46 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_squad_repos_squad ON squad_repos (squad_name);
 	CREATE INDEX IF NOT EXISTS idx_squad_repos_repo ON squad_repos (repo_name);
+
+	CREATE TABLE IF NOT EXISTS discussions (
+		id TEXT PRIMARY KEY,
+		number INTEGER NOT NULL,
+		repo_owner TEXT NOT NULL,
+		repo_name TEXT NOT NULL,
+		category_id TEXT NOT NULL DEFAULT '',
+		category_name TEXT NOT NULL DEFAULT '',
+		category_slug TEXT NOT NULL DEFAULT '',
+		squad TEXT NOT NULL DEFAULT '',
+		title TEXT NOT NULL,
+		body TEXT NOT NULL DEFAULT '',
+		author TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		url TEXT NOT NULL DEFAULT '',
+		comments_count INTEGER NOT NULL DEFAULT 0,
+		last_read_at DATETIME
+	);
+	CREATE INDEX IF NOT EXISTS idx_discussions_squad ON discussions (squad, updated_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_discussions_repo ON discussions (repo_owner, repo_name, updated_at DESC);
+
+	CREATE TABLE IF NOT EXISTS discussion_comments (
+		id TEXT PRIMARY KEY,
+		discussion_id TEXT NOT NULL,
+		author TEXT NOT NULL DEFAULT '',
+		body TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		url TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY (discussion_id) REFERENCES discussions(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_comments_disc ON discussion_comments (discussion_id, created_at ASC);
+
+	CREATE TABLE IF NOT EXISTS seen_discussion_messages (
+		message_id TEXT PRIMARY KEY,
+		discussion_id TEXT NOT NULL,
+		seen_at DATETIME NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_seen_disc ON seen_discussion_messages (discussion_id);
 	`
 	if _, err := d.db.Exec(schema); err != nil {
 		return err
