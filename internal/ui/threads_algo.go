@@ -99,12 +99,15 @@ func CalculateDiscussionScore(d github.Discussion, currentUser string, now time.
 	}
 
 	// Tier determination (replicates Hot | Warm | Cold | Dead from repository UI):
+	// Closed discussions are immediately put into Dead category!
 	// Hot: has unread mention OR updated <= 48 hours (2 days)
 	// Warm: updated <= 7 days (168 hours)
 	// Cold: updated <= 30 days (720 hours)
-	// Dead: updated > 30 days (720 hours)
+	// Dead: updated > 30 days (720 hours) OR closed
 	var tier ThreadTier
-	if hasMention && isUnread {
+	if d.IsClosed() {
+		tier = ThreadTierDead
+	} else if hasMention && isUnread {
 		tier = ThreadTierHot
 	} else if hours <= 48 {
 		tier = ThreadTierHot

@@ -17,6 +17,88 @@ import (
 	"grubby/internal/github"
 )
 
+type ThreadFeedItemKind int
+
+const (
+	FeedItemTierHeader ThreadFeedItemKind = iota
+	FeedItemThread
+)
+
+type ThreadFeedItem struct {
+	Kind       ThreadFeedItemKind
+	Tier       ThreadTier
+	ChildCount int
+	Expanded   bool
+	Discussion *ScoredDiscussion
+}
+
+func (m Model) firstSelectableThreadIndex() int {
+	items := m.getThreadFeedItems()
+	for idx, it := range items {
+		if it.Kind == FeedItemThread && it.Discussion != nil {
+			return idx
+		}
+	}
+	return 0
+}
+
+func (m Model) focusThreadCursor(id string) Model {
+	items := m.getThreadFeedItems()
+	for idx, it := range items {
+		if it.Kind == FeedItemThread && it.Discussion != nil && it.Discussion.Discussion.ID == id {
+			m.ThreadsCursor = idx
+			break
+		}
+	}
+	return m
+}
+
+func (m Model) getThreadFeedItems() []ThreadFeedItem {
+	sorted := m.getSortedDiscussions()
+	if len(sorted) == 0 {
+		return nil
+	}
+
+	tierOrder := []ThreadTier{
+		ThreadTierHot,
+		ThreadTierWarm,
+		ThreadTierCold,
+		ThreadTierDead,
+	}
+
+	tierDiscussions := make(map[ThreadTier][]ScoredDiscussion)
+	for _, sd := range sorted {
+		tierDiscussions[sd.Tier] = append(tierDiscussions[sd.Tier], sd)
+	}
+
+	var items []ThreadFeedItem
+	for _, tier := range tierOrder {
+		list := tierDiscussions[tier]
+		if len(list) == 0 {
+			continue
+		}
+		collapsed := m.isThreadTierCollapsed(tier)
+		items = append(items, ThreadFeedItem{
+			Kind:       FeedItemTierHeader,
+			Tier:       tier,
+			ChildCount: len(list),
+			Expanded:   !collapsed,
+		})
+		if !collapsed {
+			for i := range list {
+				sdCopy := list[i]
+				items = append(items, ThreadFeedItem{
+					Kind:       FeedItemThread,
+					Tier:       tier,
+					Discussion: &sdCopy,
+				})
+			}
+		}
+	}
+
+	return items
+}
+
 func (m *Model) recalculateDiscussionOrder() {
 	squad := ""
 	var otherSquads []string
@@ -34,9 +116,11 @@ func (m *Model) recalculateDiscussionOrder() {
 	var scored []ScoredDiscussion
 
 	currentSelectedID := ""
-	visible := m.getVisibleDiscussions()
-	if len(visible) > 0 && m.ThreadsCursor >= 0 && m.ThreadsCursor < len(visible) {
-		currentSelectedID = visible[m.ThreadsCursor].Discussion.ID
+	items := m.getThreadFeedItems()
+	if len(items) > 0 && m.ThreadsCursor >= 0 && m.ThreadsCursor < len(items) {
+		if items[m.ThreadsCursor].Kind == FeedItemThread && items[m.ThreadsCursor].Discussion != nil {
+			currentSelectedID = items[m.ThreadsCursor].Discussion.Discussion.ID
+		}
 	}
 
 	for _, d := range filtered {
@@ -52,9 +136,9 @@ func (m *Model) recalculateDiscussionOrder() {
 	m.LastThreadsSort = now
 
 	if currentSelectedID != "" {
-		newVisible := m.getVisibleDiscussions()
-		for i, sd := range newVisible {
-			if sd.Discussion.ID == currentSelectedID {
+		newItems := m.getThreadFeedItems()
+		for i, it := range newItems {
+			if it.Kind == FeedItemThread && it.Discussion != nil && it.Discussion.Discussion.ID == currentSelectedID {
 				m.ThreadsCursor = i
 				break
 			}
@@ -94,32 +178,34 @@ func (m Model) getSortedDiscussions() []ScoredDiscussion {
 }
 
 func (m Model) getVisibleDiscussions() []ScoredDiscussion {
-	sorted := m.getSortedDiscussions()
+	items := m.getThreadFeedItems()
 	var visible []ScoredDiscussion
-	for _, sd := range sorted {
-		// Only collapse anything other than hot and warm (Cold and Dead)
-		if (sd.Tier == ThreadTierCold || sd.Tier == ThreadTierDead) && !m.ThreadsDeadExpanded {
-			continue
+	for _, it := range items {
+		if it.Kind == FeedItemThread && it.Discussion != nil {
+			visible = append(visible, *it.Discussion)
 		}
-		visible = append(visible, sd)
 	}
 	return visible
 }
 
 func (m Model) getSelectedDiscussion() *github.Discussion {
-	visible := m.getVisibleDiscussions()
-	if len(visible) == 0 {
+	items := m.getThreadFeedItems()
+	if len(items) == 0 {
 		return nil
 	}
 	idx := m.ThreadsCursor
 	if idx < 0 {
 		idx = 0
 	}
-	if idx >= len(visible) {
-		idx = len(visible) - 1
+	if idx >= len(items) {
+		idx = len(items) - 1
 	}
-	disc := visible[idx].Discussion
-	return &disc
+	item := items[idx]
+	if item.Kind == FeedItemThread && item.Discussion != nil {
+		disc := item.Discussion.Discussion
+		return &disc
+	}
+	return nil
 }
 
 // wrapRunes replicates the exact word-wrapping algorithm used internally by
@@ -889,6 +975,14 @@ func (m Model) renderThreadsView() string {
 		}
 	}
 
+	items := m.getThreadFeedItems()
+	isCursorOnTierHeader := false
+	if len(items) > 0 && m.ThreadsCursor >= 0 && m.ThreadsCursor < len(items) {
+		if items[m.ThreadsCursor].Kind == FeedItemTierHeader {
+			isCursorOnTierHeader = true
+		}
+	}
+
 	// 1. Top Meta Banner (removed "Squad: [my-squad] |", replicated repo UI: 🔥 Hot 🌞 Warm 🧊 Cold 💀 Dead)
 	var bannerText string
 	if m.ThreadsEditActive {
@@ -904,27 +998,17 @@ func (m Model) renderThreadsView() string {
 			discNum = disc.Number
 		}
 		bannerText = fmt.Sprintf("  [FOCUSED THREAD #%d]  |  [f/Esc] Exit Focus  [r] Reply  [e] Edit  [t] Title  [→/l] Messages  [y] Yank", discNum)
+	} else if isCursorOnTierHeader {
+		bannerText = "  [TIER HEADER]  |  [Space/Enter] Toggle Tier  [←/h] Collapse  [→/l] Expand  [Z] Collapse All  [E] Expand All  [j/k] Navigate"
 	} else {
 		tierSummary := fmt.Sprintf("🔥 %d Hot  🌞 %d Warm  🧊 %d Cold  💀 %d Dead", hotCount, warmCount, coldCount, deadCount)
 		bannerText = fmt.Sprintf("  %s  |  [c] New  [r] Reply  [e] Edit  [t] Title  [→] Expand  [←] Collapse  [f] Focus  [y] Yank  [R] Refresh", tierSummary)
 	}
 	banner := MetaBarStyle.Width(width).Render(bannerText)
 
-	visible := m.getVisibleDiscussions()
-	if m.ThreadsFocused && len(visible) > 0 {
-		idx := m.ThreadsCursor
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= len(visible) {
-			idx = len(visible) - 1
-		}
-		visible = []ScoredDiscussion{visible[idx]}
-	}
-
 	var feedBlocks []string
 
-	if len(visible) == 0 {
+	if len(items) == 0 {
 		feedBlocks = append(feedBlocks, lipgloss.NewStyle().Foreground(MutedColor).Render("\n  No discussions in this squad.\n  Press [c] to start a new thread!"))
 	} else {
 		authorStyle := lipgloss.NewStyle().Foreground(PrimaryColor).Bold(true)
@@ -933,7 +1017,71 @@ func (m Model) renderThreadsView() string {
 		timeStyle := lipgloss.NewStyle().Foreground(MutedColor)
 		titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#708090"))
 
-		for idx, sd := range visible {
+		displayItems := items
+		if m.ThreadsFocused {
+			disc := m.getSelectedDiscussion()
+			if disc != nil {
+				for _, it := range items {
+					if it.Kind == FeedItemThread && it.Discussion != nil && it.Discussion.Discussion.ID == disc.ID {
+						displayItems = []ThreadFeedItem{it}
+						break
+					}
+				}
+			}
+		}
+
+		for idx, it := range displayItems {
+			if it.Kind == FeedItemTierHeader {
+				arrow := "▼"
+				if !it.Expanded {
+					arrow = "▶"
+				}
+				tierIcon := it.Tier.Icon()
+				tierName := strings.ToUpper(it.Tier.String())
+
+				unit := "threads"
+				if it.ChildCount == 1 {
+					unit = "thread"
+				}
+				headerText := fmt.Sprintf("%s %s %s (%d %s)", arrow, tierIcon, tierName, it.ChildCount, unit)
+				if !it.Expanded {
+					headerText += "  ── [Space to expand]"
+				} else {
+					headerText += "  ── [Space to collapse]"
+				}
+
+				totalW := feedWidth
+				if len(headerText) < totalW {
+					headerText += " " + strings.Repeat("─", totalW-len(headerText)-1)
+				}
+
+				var tierColor lipgloss.Color
+				switch it.Tier {
+				case ThreadTierHot:
+					tierColor = lipgloss.Color("#FF7B72")
+				case ThreadTierWarm:
+					tierColor = lipgloss.Color("#E5C07B")
+				case ThreadTierCold:
+					tierColor = lipgloss.Color("#79C0FF")
+				case ThreadTierDead:
+					tierColor = lipgloss.Color("#6E7681")
+				default:
+					tierColor = lipgloss.Color("#E5C07B")
+				}
+
+				styledHeader := lipgloss.NewStyle().Foreground(tierColor).Bold(true).Render(headerText)
+
+				cursorPrefix := "  "
+				if idx == m.ThreadsCursor && !m.ThreadsFocused {
+					cursorPrefix = lipgloss.NewStyle().Foreground(SecondaryColor).Bold(true).Render("▶ ")
+				}
+
+				feedBlocks = append(feedBlocks, cursorPrefix+styledHeader)
+				continue
+			}
+
+			// it.Kind == FeedItemThread:
+			sd := *it.Discussion
 			disc := sd.Discussion
 			isCurrentThread := (idx == m.ThreadsCursor || m.ThreadsFocused)
 			hasUnread := sd.IsUnread || m.isDiscussionUnread(disc)
@@ -1088,14 +1236,6 @@ func (m Model) renderThreadsView() string {
 			}
 
 			feedBlocks = append(feedBlocks, "") // Clean spacing between threads
-		}
-
-		collapsedCount := coldCount + deadCount
-		if !m.ThreadsDeadExpanded && !m.ThreadsFocused && collapsedCount > 0 {
-			collapsePrompt := lipgloss.NewStyle().Foreground(MutedColor).Italic(true).Render(
-				fmt.Sprintf("  ▶ %d Cold / Dead threads collapsed [D to expand]", collapsedCount),
-			)
-			feedBlocks = append(feedBlocks, collapsePrompt)
 		}
 	}
 
@@ -1399,10 +1539,160 @@ func (m Model) handleThreadsKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	visible := m.getVisibleDiscussions()
-	disc := m.getSelectedDiscussion()
+	items := m.getThreadFeedItems()
+	if len(items) == 0 {
+		switch key {
+		case "c", "n":
+			m.ActiveModal = ModalCreateThread
+			if m.ThreadCreateInput.Placeholder == "" {
+				m.ThreadCreateInput = textarea.New()
+			}
+			m.ThreadCreateInput.Reset()
+			m.ThreadCreateInput.Focus()
+			m.AutocompleteActive = false
+			return m, nil
+		case "R":
+			m.LastDiscussionsSync = time.Now()
+			m.StatusMsg = "Refreshing threads from GitHub..."
+			m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+			return m, tea.Batch(m.loadDiscussionsCmd(), m.Spinner.Tick)
+		}
+		return m, nil
+	}
 
-	// 3. Message-Level Navigation (when descended into thread messages)
+	if m.ThreadsCursor < 0 {
+		m.ThreadsCursor = 0
+	}
+	if m.ThreadsCursor >= len(items) {
+		m.ThreadsCursor = len(items) - 1
+	}
+
+	currentItem := items[m.ThreadsCursor]
+
+	// 3. Key handling when cursor is on Tier Header
+	if currentItem.Kind == FeedItemTierHeader {
+		switch key {
+		case "enter", " ":
+			if m.ThreadsCollapsedTiers == nil {
+				m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+			}
+			isCollapsed := m.isThreadTierCollapsed(currentItem.Tier)
+			m.ThreadsCollapsedTiers[currentItem.Tier] = !isCollapsed
+			newItems := m.getThreadFeedItems()
+			if m.ThreadsCursor >= len(newItems) {
+				m.ThreadsCursor = len(newItems) - 1
+			}
+			action := "Expanded"
+			if !isCollapsed {
+				action = "Collapsed"
+			}
+			m.StatusMsg = fmt.Sprintf("%s %s tier", action, currentItem.Tier.String())
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "h", "left", "[":
+			if m.ThreadsCollapsedTiers == nil {
+				m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+			}
+			m.ThreadsCollapsedTiers[currentItem.Tier] = true
+			newItems := m.getThreadFeedItems()
+			if m.ThreadsCursor >= len(newItems) {
+				m.ThreadsCursor = len(newItems) - 1
+			}
+			m.StatusMsg = fmt.Sprintf("Collapsed %s tier", currentItem.Tier.String())
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "l", "right", "]":
+			if m.ThreadsCollapsedTiers == nil {
+				m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+			}
+			m.ThreadsCollapsedTiers[currentItem.Tier] = false
+			m.StatusMsg = fmt.Sprintf("Expanded %s tier", currentItem.Tier.String())
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "E":
+			if m.ThreadsCollapsedTiers == nil {
+				m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+			}
+			for _, t := range []ThreadTier{ThreadTierHot, ThreadTierWarm, ThreadTierCold, ThreadTierDead} {
+				m.ThreadsCollapsedTiers[t] = false
+			}
+			m.StatusMsg = "Expanded all thread tiers"
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "C", "Z":
+			if m.ThreadsCollapsedTiers == nil {
+				m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+			}
+			for _, t := range []ThreadTier{ThreadTierHot, ThreadTierWarm, ThreadTierCold, ThreadTierDead} {
+				m.ThreadsCollapsedTiers[t] = true
+			}
+			newItems := m.getThreadFeedItems()
+			if m.ThreadsCursor >= len(newItems) {
+				m.ThreadsCursor = len(newItems) - 1
+			}
+			m.StatusMsg = "Collapsed all thread tiers"
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "D":
+			if m.ThreadsCollapsedTiers == nil {
+				m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+			}
+			deadCollapsed := m.isThreadTierCollapsed(ThreadTierDead)
+			m.ThreadsCollapsedTiers[ThreadTierDead] = !deadCollapsed
+			m.ThreadsCollapsedTiers[ThreadTierCold] = !deadCollapsed
+			m.ThreadsDeadExpanded = deadCollapsed
+			if deadCollapsed {
+				m.StatusMsg = "Expanded Cold and Dead tiers"
+			} else {
+				m.StatusMsg = "Collapsed Cold and Dead tiers"
+			}
+			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
+
+		case "j", "down":
+			if m.ThreadsCursor < len(items)-1 {
+				m.ThreadsCursor++
+				m.markCurrentThreadViewed()
+			}
+			return m, nil
+
+		case "k", "up":
+			if m.ThreadsCursor > 0 {
+				m.ThreadsCursor--
+				m.markCurrentThreadViewed()
+			}
+			return m, nil
+
+		case "c", "n":
+			m.ActiveModal = ModalCreateThread
+			if m.ThreadCreateInput.Placeholder == "" {
+				m.ThreadCreateInput = textarea.New()
+			}
+			m.ThreadCreateInput.Reset()
+			m.ThreadCreateInput.Focus()
+			m.AutocompleteActive = false
+			return m, nil
+
+		case "R":
+			m.LastDiscussionsSync = time.Now()
+			m.StatusMsg = "Refreshing threads from GitHub..."
+			m.StatusMsgTimer = time.Now().Add(3 * time.Second)
+			return m, tea.Batch(m.loadDiscussionsCmd(), m.Spinner.Tick)
+
+		default:
+			return m, nil
+		}
+	}
+
+	// 4. Key handling when cursor is on a Thread
+	disc := &currentItem.Discussion.Discussion
+
+	// 4a. Message-Level Navigation (when descended into thread messages)
 	if m.ThreadsSelectedMsgIdx >= 0 && disc != nil {
 		comments := m.DiscussionComments[disc.ID]
 		if len(comments) == 0 {
@@ -1415,7 +1705,7 @@ func (m Model) handleThreadsKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			if m.ThreadsSelectedMsgIdx < totalMsgs-1 {
 				m.ThreadsSelectedMsgIdx++
 				m.markCurrentThreadViewed()
-			} else if m.ThreadsCursor < len(visible)-1 {
+			} else if m.ThreadsCursor < len(items)-1 {
 				m.ThreadsCursor++
 				m.ThreadsSelectedMsgIdx = -1
 				m.markCurrentThreadViewed()
@@ -1551,11 +1841,17 @@ func (m Model) handleThreadsKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m, nil
 
 		case "D":
-			m.ThreadsDeadExpanded = !m.ThreadsDeadExpanded
-			if m.ThreadsDeadExpanded {
-				m.StatusMsg = "Expanded Cold and Dead threads"
+			if m.ThreadsCollapsedTiers == nil {
+				m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+			}
+			deadCollapsed := m.isThreadTierCollapsed(ThreadTierDead)
+			m.ThreadsCollapsedTiers[ThreadTierDead] = !deadCollapsed
+			m.ThreadsCollapsedTiers[ThreadTierCold] = !deadCollapsed
+			m.ThreadsDeadExpanded = deadCollapsed
+			if deadCollapsed {
+				m.StatusMsg = "Expanded Cold and Dead tiers"
 			} else {
-				m.StatusMsg = "Collapsed Cold and Dead threads"
+				m.StatusMsg = "Collapsed Cold and Dead tiers"
 			}
 			m.StatusMsgTimer = time.Now().Add(3 * time.Second)
 			return m, nil
@@ -1575,10 +1871,10 @@ func (m Model) handleThreadsKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 4. Thread-Level Navigation
+	// 4b. Thread-Level Navigation
 	switch key {
 	case "j", "down":
-		if m.ThreadsCursor < len(visible)-1 {
+		if m.ThreadsCursor < len(items)-1 {
 			m.ThreadsCursor++
 			m.markCurrentThreadViewed()
 		}
@@ -1593,19 +1889,32 @@ func (m Model) handleThreadsKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case "h", "left":
 		if disc != nil {
-			if m.ThreadsCollapsedIDs == nil {
-				m.ThreadsCollapsedIDs = make(map[string]bool)
+			hasUnread := currentItem.Discussion.IsUnread || m.isDiscussionUnread(*disc)
+			if m.isThreadExpanded(disc.ID, hasUnread) {
+				if m.ThreadsCollapsedIDs == nil {
+					m.ThreadsCollapsedIDs = make(map[string]bool)
+				}
+				m.ThreadsCollapsedIDs[disc.ID] = true
+				if m.ThreadsExpandedID == disc.ID {
+					m.ThreadsExpandedID = ""
+				}
+				if m.ThreadsFocused {
+					m.ThreadsFocused = false
+				}
+				m.ThreadsSelectedMsgIdx = -1
+				m.StatusMsg = "Collapsed thread"
+				m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+				return m, nil
 			}
-			m.ThreadsCollapsedIDs[disc.ID] = true
-			if m.ThreadsExpandedID == disc.ID {
-				m.ThreadsExpandedID = ""
+
+			// If already collapsed, jump cursor up to parent tier header
+			for idx, it := range items {
+				if it.Kind == FeedItemTierHeader && it.Tier == currentItem.Tier {
+					m.ThreadsCursor = idx
+					break
+				}
 			}
-			if m.ThreadsFocused {
-				m.ThreadsFocused = false
-			}
-			m.ThreadsSelectedMsgIdx = -1
-			m.StatusMsg = "Collapsed thread"
-			m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+			return m, nil
 		}
 		return m, nil
 
@@ -1731,12 +2040,44 @@ func (m Model) handleThreadsKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "E":
+		if m.ThreadsCollapsedTiers == nil {
+			m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+		}
+		for _, t := range []ThreadTier{ThreadTierHot, ThreadTierWarm, ThreadTierCold, ThreadTierDead} {
+			m.ThreadsCollapsedTiers[t] = false
+		}
+		m.StatusMsg = "Expanded all thread tiers"
+		m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+		return m, nil
+
+	case "C", "Z":
+		if m.ThreadsCollapsedTiers == nil {
+			m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+		}
+		for _, t := range []ThreadTier{ThreadTierHot, ThreadTierWarm, ThreadTierCold, ThreadTierDead} {
+			m.ThreadsCollapsedTiers[t] = true
+		}
+		newItems := m.getThreadFeedItems()
+		if m.ThreadsCursor >= len(newItems) {
+			m.ThreadsCursor = len(newItems) - 1
+		}
+		m.StatusMsg = "Collapsed all thread tiers"
+		m.StatusMsgTimer = time.Now().Add(2 * time.Second)
+		return m, nil
+
 	case "D":
-		m.ThreadsDeadExpanded = !m.ThreadsDeadExpanded
-		if m.ThreadsDeadExpanded {
-			m.StatusMsg = "Expanded Cold and Dead threads"
+		if m.ThreadsCollapsedTiers == nil {
+			m.ThreadsCollapsedTiers = make(map[ThreadTier]bool)
+		}
+		deadCollapsed := m.isThreadTierCollapsed(ThreadTierDead)
+		m.ThreadsCollapsedTiers[ThreadTierDead] = !deadCollapsed
+		m.ThreadsCollapsedTiers[ThreadTierCold] = !deadCollapsed
+		m.ThreadsDeadExpanded = deadCollapsed
+		if deadCollapsed {
+			m.StatusMsg = "Expanded Cold and Dead tiers"
 		} else {
-			m.StatusMsg = "Collapsed Cold and Dead threads"
+			m.StatusMsg = "Collapsed Cold and Dead tiers"
 		}
 		m.StatusMsgTimer = time.Now().Add(3 * time.Second)
 		return m, nil

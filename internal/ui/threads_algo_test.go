@@ -106,8 +106,34 @@ func TestCalculateDiscussionScore(t *testing.T) {
 		t.Errorf("expected HasMention and IsUnread true, got mention=%v unread=%v", s4.HasMention, s4.IsUnread)
 	}
 
+	// Closed discussion (Closed=true): immediately placed in Dead tier regardless of how recently updated
+	dClosed1 := github.Discussion{
+		ID:            "D_Closed1",
+		Title:         "Recently Closed Discussion 1",
+		UpdatedAt:     now.Add(-5 * time.Minute),
+		CommentsCount: 10,
+		Closed:        true,
+	}
+	sClosed1 := CalculateDiscussionScore(dClosed1, "simon", now)
+	if sClosed1.Tier != ThreadTierDead {
+		t.Errorf("expected TierDead for closed discussion (Closed=true), got %v", sClosed1.Tier)
+	}
+
+	// Closed discussion (State="CLOSED"): immediately placed in Dead tier
+	dClosed2 := github.Discussion{
+		ID:            "D_Closed2",
+		Title:         "Recently Closed Discussion 2",
+		UpdatedAt:     now.Add(-5 * time.Minute),
+		CommentsCount: 10,
+		State:         "CLOSED",
+	}
+	sClosed2 := CalculateDiscussionScore(dClosed2, "simon", now)
+	if sClosed2.Tier != ThreadTierDead {
+		t.Errorf("expected TierDead for closed discussion (State='CLOSED'), got %v", sClosed2.Tier)
+	}
+
 	// Sorting: Hot > Warm > Cold > Dead
-	sorted := SortDiscussions([]ScoredDiscussion{sDead, s3, s2, s1, s4})
+	sorted := SortDiscussions([]ScoredDiscussion{sDead, s3, s2, s1, s4, sClosed1})
 	if sorted[0].Tier != ThreadTierHot || sorted[len(sorted)-1].Tier != ThreadTierDead {
 		t.Errorf("unexpected sort order: %+v", sorted)
 	}

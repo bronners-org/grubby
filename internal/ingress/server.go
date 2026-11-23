@@ -719,7 +719,9 @@ type rawDiscussionPayload struct {
 			Name string `json:"name"`
 			Slug string `json:"slug"`
 		} `json:"category"`
-		Comments int `json:"comments"`
+		Comments int    `json:"comments"`
+		State    string `json:"state"`
+		ClosedAt string `json:"closed_at"`
 	} `json:"discussion"`
 	Repository struct {
 		Name     string `json:"name"`
@@ -763,7 +765,9 @@ type rawDiscussionCommentPayload struct {
 			Name string `json:"name"`
 			Slug string `json:"slug"`
 		} `json:"category"`
-		Comments int `json:"comments"`
+		Comments int    `json:"comments"`
+		State    string `json:"state"`
+		ClosedAt string `json:"closed_at"`
 	} `json:"discussion"`
 	Repository struct {
 		Name     string `json:"name"`
@@ -805,6 +809,17 @@ func (s *Server) processDiscussion(body []byte) error {
 			Name: payload.Discussion.Category.Name,
 			Slug: payload.Discussion.Category.Slug,
 		},
+	}
+
+	isClosed := (payload.Action == "closed" || payload.Discussion.State == "closed" || payload.Discussion.ClosedAt != "")
+	if payload.Action == "reopened" {
+		isClosed = false
+	}
+	disc.Closed = isClosed
+	if isClosed {
+		disc.State = "closed"
+	} else {
+		disc.State = "open"
 	}
 
 	action := protocol.ActionUpdated
@@ -861,6 +876,17 @@ func (s *Server) processDiscussionComment(body []byte) error {
 			Name: payload.Discussion.Category.Name,
 			Slug: payload.Discussion.Category.Slug,
 		},
+	}
+
+	isClosed := (payload.Action == "closed" || payload.Discussion.State == "closed" || payload.Discussion.ClosedAt != "")
+	if payload.Action == "reopened" {
+		isClosed = false
+	}
+	disc.Closed = isClosed
+	if isClosed {
+		disc.State = "closed"
+	} else {
+		disc.State = "open"
 	}
 
 	cm := github.DiscussionComment{

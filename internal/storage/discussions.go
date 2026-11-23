@@ -22,8 +22,8 @@ func (d *DB) SaveDiscussions(discussions []github.Discussion, squad string) erro
 	stmtDisc, err := tx.Prepare(`
 		INSERT INTO discussions (
 			id, number, repo_owner, repo_name, category_id, category_name, category_slug,
-			squad, title, body, author, created_at, updated_at, url, comments_count
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			squad, title, body, author, created_at, updated_at, url, comments_count, closed
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			number=excluded.number,
 			repo_owner=excluded.repo_owner,
@@ -37,7 +37,8 @@ func (d *DB) SaveDiscussions(discussions []github.Discussion, squad string) erro
 			author=excluded.author,
 			updated_at=excluded.updated_at,
 			url=excluded.url,
-			comments_count=excluded.comments_count
+			comments_count=excluded.comments_count,
+			closed=excluded.closed
 	`)
 	if err != nil {
 		return err
@@ -71,11 +72,17 @@ func (d *DB) SaveDiscussions(discussions []github.Discussion, squad string) erro
 			}
 		}
 
+		closedVal := 0
+		if disc.IsClosed() {
+			closedVal = 1
+		}
+
 		_, err := stmtDisc.Exec(
 			disc.ID, disc.Number, disc.RepoOwner, disc.RepoName,
 			disc.Category.ID, disc.Category.Name, disc.Category.Slug,
 			discSquad, disc.Title, disc.Body, disc.Author,
 			disc.CreatedAt, disc.UpdatedAt, disc.URL, disc.CommentsCount,
+			closedVal,
 		)
 		if err != nil {
 			return err
@@ -147,7 +154,7 @@ func (d *DB) GetDiscussions(squad string) ([]github.Discussion, error) {
 
 	query := `
 		SELECT id, number, repo_owner, repo_name, category_id, category_name, category_slug,
-		       squad, title, body, author, created_at, updated_at, url, comments_count, last_read_at
+		       squad, title, body, author, created_at, updated_at, url, comments_count, last_read_at, closed
 		FROM discussions
 	`
 	var args []interface{}
@@ -168,18 +175,25 @@ func (d *DB) GetDiscussions(squad string) ([]github.Discussion, error) {
 		var disc github.Discussion
 		var lastRead sql.NullTime
 		var squadVal string
+		var closedVal int
 		err := rows.Scan(
 			&disc.ID, &disc.Number, &disc.RepoOwner, &disc.RepoName,
 			&disc.Category.ID, &disc.Category.Name, &disc.Category.Slug,
 			&squadVal, &disc.Title, &disc.Body, &disc.Author,
 			&disc.CreatedAt, &disc.UpdatedAt, &disc.URL, &disc.CommentsCount,
-			&lastRead,
+			&lastRead, &closedVal,
 		)
 		if err != nil {
 			return nil, err
 		}
 		if lastRead.Valid {
 			disc.LastReadAt = lastRead.Time
+		}
+		disc.Closed = (closedVal != 0)
+		if disc.Closed {
+			disc.State = "closed"
+		} else {
+			disc.State = "open"
 		}
 		results = append(results, disc)
 	}
@@ -193,19 +207,20 @@ func (d *DB) GetDiscussion(id string) (*github.Discussion, error) {
 
 	query := `
 		SELECT id, number, repo_owner, repo_name, category_id, category_name, category_slug,
-		       squad, title, body, author, created_at, updated_at, url, comments_count, last_read_at
+		       squad, title, body, author, created_at, updated_at, url, comments_count, last_read_at, closed
 		FROM discussions
 		WHERE id = ?
 	`
 	var disc github.Discussion
 	var lastRead sql.NullTime
 	var squadVal string
+	var closedVal int
 	err := d.db.QueryRow(query, id).Scan(
 		&disc.ID, &disc.Number, &disc.RepoOwner, &disc.RepoName,
 		&disc.Category.ID, &disc.Category.Name, &disc.Category.Slug,
 		&squadVal, &disc.Title, &disc.Body, &disc.Author,
 		&disc.CreatedAt, &disc.UpdatedAt, &disc.URL, &disc.CommentsCount,
-		&lastRead,
+		&lastRead, &closedVal,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -215,6 +230,12 @@ func (d *DB) GetDiscussion(id string) (*github.Discussion, error) {
 	}
 	if lastRead.Valid {
 		disc.LastReadAt = lastRead.Time
+	}
+	disc.Closed = (closedVal != 0)
+	if disc.Closed {
+		disc.State = "closed"
+	} else {
+		disc.State = "open"
 	}
 	return &disc, nil
 }
