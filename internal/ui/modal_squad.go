@@ -45,6 +45,16 @@ func (m Model) handleModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleCreatePRTaskModalKeys(msg)
 	case ModalAssignSquadTask:
 		return m.handleAssignSquadTaskModalKeys(msg)
+	case ModalCreateThread:
+		return m.handleCreateThreadModalKeys(msg)
+	case ModalReplyThread:
+		return m.handleReplyThreadModalKeys(msg)
+	case ModalEditThreadTitle:
+		return m.handleEditThreadTitleModalKeys(msg)
+	case ModalEditMessage:
+		return m.handleEditMessageModalKeys(msg)
+	case ModalYankLinks:
+		return m.handleYankLinksModalKeys(msg)
 	case ModalHelp:
 		if msg.String() == "esc" || msg.String() == "q" || msg.String() == "?" {
 			m.ActiveModal = ModalNone
@@ -87,6 +97,16 @@ func (m Model) renderModalOverlay(baseView string) string {
 		modalContent = m.renderCreatePRTaskModal()
 	case ModalAssignSquadTask:
 		modalContent = m.renderAssignSquadTaskModal()
+	case ModalCreateThread:
+		modalContent = m.renderCreateThreadModal()
+	case ModalReplyThread:
+		modalContent = m.renderReplyThreadModal()
+	case ModalEditThreadTitle:
+		modalContent = m.renderEditThreadTitleModal()
+	case ModalEditMessage:
+		modalContent = m.renderEditMessageModal()
+	case ModalYankLinks:
+		modalContent = m.renderYankLinksModal()
 	case ModalHelp:
 		modalContent = m.renderHelpModal()
 	}

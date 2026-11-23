@@ -149,6 +149,10 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		processErr = s.processPullRequestReview(body)
 	case "issues":
 		processErr = s.processIssues(body)
+	case "discussion":
+		processErr = s.processDiscussion(body)
+	case "discussion_comment":
+		processErr = s.processDiscussionComment(body)
 	case "push":
 		processErr = s.processPush(body)
 	default:
@@ -695,6 +699,193 @@ func (s *Server) processPush(body []byte) error {
 }
 
 // --- Server-Sent Events (SSE) Stream Endpoint ---
+
+type rawDiscussionPayload struct {
+	Action     string `json:"action"`
+	Discussion struct {
+		ID        int64  `json:"id"`
+		NodeID    string `json:"node_id"`
+		Number    int    `json:"number"`
+		Title     string `json:"title"`
+		Body      string `json:"body"`
+		HTMLURL   string `json:"html_url"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Category struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+			Slug string `json:"slug"`
+		} `json:"category"`
+		Comments int `json:"comments"`
+	} `json:"discussion"`
+	Repository struct {
+		Name     string `json:"name"`
+		FullName string `json:"full_name"`
+		Owner    struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+}
+
+type rawDiscussionCommentPayload struct {
+	Action  string `json:"action"`
+	Comment struct {
+		ID        int64  `json:"id"`
+		NodeID    string `json:"node_id"`
+		Body      string `json:"body"`
+		HTMLURL   string `json:"html_url"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	} `json:"comment"`
+	Discussion struct {
+		ID        int64  `json:"id"`
+		NodeID    string `json:"node_id"`
+		Number    int    `json:"number"`
+		Title     string `json:"title"`
+		Body      string `json:"body"`
+		HTMLURL   string `json:"html_url"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Category struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+			Slug string `json:"slug"`
+		} `json:"category"`
+		Comments int `json:"comments"`
+	} `json:"discussion"`
+	Repository struct {
+		Name     string `json:"name"`
+		FullName string `json:"full_name"`
+		Owner    struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+}
+
+func (s *Server) processDiscussion(body []byte) error {
+	var payload rawDiscussionPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return err
+	}
+
+	discID := payload.Discussion.NodeID
+	if discID == "" {
+		discID = fmt.Sprintf("D_%d", payload.Discussion.ID)
+	}
+
+	disc := github.Discussion{
+		ID:            discID,
+		Number:        payload.Discussion.Number,
+		RepoOwner:     payload.Repository.Owner.Login,
+		RepoName:      payload.Repository.Name,
+		Title:         payload.Discussion.Title,
+		Body:          payload.Discussion.Body,
+		Author:        payload.Discussion.User.Login,
+		CreatedAt:     parseTimeField(payload.Discussion.CreatedAt),
+		UpdatedAt:     parseTimeField(payload.Discussion.UpdatedAt),
+		URL:           payload.Discussion.HTMLURL,
+		CommentsCount: payload.Discussion.Comments,
+		Category: github.DiscussionCategory{
+			ID:   fmt.Sprintf("%d", payload.Discussion.Category.ID),
+			Name: payload.Discussion.Category.Name,
+			Slug: payload.Discussion.Category.Slug,
+		},
+	}
+
+	action := protocol.ActionUpdated
+	switch payload.Action {
+	case "created":
+		action = protocol.ActionCreated
+	case "deleted":
+		action = protocol.ActionDeleted
+	}
+
+	if s.db != nil {
+		_ = s.db.SaveDiscussion(disc, disc.Category.Name)
+	}
+
+	if s.bus != nil {
+		evt, err := protocol.NewDiscussionEvent(action, disc, nil)
+		if err == nil {
+			s.bus.Publish(evt)
+		}
+	}
+	return nil
+}
+
+func (s *Server) processDiscussionComment(body []byte) error {
+	var payload rawDiscussionCommentPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return err
+	}
+
+	discID := payload.Discussion.NodeID
+	if discID == "" {
+		discID = fmt.Sprintf("D_%d", payload.Discussion.ID)
+	}
+
+	cmID := payload.Comment.NodeID
+	if cmID == "" {
+		cmID = fmt.Sprintf("DC_%d", payload.Comment.ID)
+	}
+
+	disc := github.Discussion{
+		ID:            discID,
+		Number:        payload.Discussion.Number,
+		RepoOwner:     payload.Repository.Owner.Login,
+		RepoName:      payload.Repository.Name,
+		Title:         payload.Discussion.Title,
+		Body:          payload.Discussion.Body,
+		Author:        payload.Discussion.User.Login,
+		CreatedAt:     parseTimeField(payload.Discussion.CreatedAt),
+		UpdatedAt:     parseTimeField(payload.Discussion.UpdatedAt),
+		URL:           payload.Discussion.HTMLURL,
+		CommentsCount: payload.Discussion.Comments,
+		Category: github.DiscussionCategory{
+			ID:   fmt.Sprintf("%d", payload.Discussion.Category.ID),
+			Name: payload.Discussion.Category.Name,
+			Slug: payload.Discussion.Category.Slug,
+		},
+	}
+
+	cm := github.DiscussionComment{
+		ID:           cmID,
+		DiscussionID: discID,
+		Author:       payload.Comment.User.Login,
+		Body:         payload.Comment.Body,
+		CreatedAt:    parseTimeField(payload.Comment.CreatedAt),
+		UpdatedAt:    parseTimeField(payload.Comment.UpdatedAt),
+		URL:          payload.Comment.HTMLURL,
+	}
+
+	if s.db != nil {
+		_ = s.db.SaveDiscussion(disc, disc.Category.Name)
+		_ = s.db.SaveDiscussionComment(cm)
+	}
+
+	if s.bus != nil {
+		evt, err := protocol.NewDiscussionEvent(protocol.ActionUpdated, disc, &cm)
+		if err == nil {
+			s.bus.Publish(evt)
+		}
+	}
+	return nil
+}
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
