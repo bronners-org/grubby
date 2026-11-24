@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -441,6 +442,114 @@ func (c *Client) queryGraphQL(ctx context.Context, query string, variables map[s
 
 // FetchRepositoriesAndPRs fetches repos, open PRs, commit events, and vulnerability summaries for an owner (org or user).
 // Decoupled into optimized repository and indexed search queries to avoid GitHub 10s backend timeouts on large enterprise orgs.
+type vulnerabilityAlertNode struct {
+	SecurityVulnerability struct {
+		Severity string `json:"severity"`
+		Package  struct {
+			Name string `json:"name"`
+		} `json:"package"`
+	} `json:"securityVulnerability"`
+}
+
+type vulnerabilityAlertsPage struct {
+	TotalCount int `json:"totalCount"`
+	PageInfo   struct {
+		HasNextPage bool    `json:"hasNextPage"`
+		EndCursor   *string `json:"endCursor"`
+	} `json:"pageInfo"`
+	Nodes []vulnerabilityAlertNode `json:"nodes"`
+}
+
+func accumulateVulnerabilityNodes(nodes []vulnerabilityAlertNode, crit, high, med, low *int, packages *[]string, seenPkg map[string]bool) {
+	for _, va := range nodes {
+		pkgName := va.SecurityVulnerability.Package.Name
+		if pkgName != "" && !seenPkg[pkgName] {
+			seenPkg[pkgName] = true
+			*packages = append(*packages, pkgName)
+		}
+		switch strings.ToUpper(va.SecurityVulnerability.Severity) {
+		case "CRITICAL":
+			*crit++
+		case "HIGH":
+			*high++
+		case "MODERATE", "MEDIUM":
+			*med++
+		default:
+			*low++
+		}
+	}
+}
+
+func (c *Client) buildSecuritySummary(ctx context.Context, owner, repoName string, initial vulnerabilityAlertsPage) SecurityAlertSummary {
+	crit, high, med, low := 0, 0, 0, 0
+	var packages []string
+	seenPkg := make(map[string]bool)
+	accumulateVulnerabilityNodes(initial.Nodes, &crit, &high, &med, &low, &packages, seenPkg)
+
+	// Paginate remaining alerts when a repo has more than the initial page (e.g., 500 CVEs)
+	cursor := initial.PageInfo.EndCursor
+	hasNext := initial.PageInfo.HasNextPage
+	if hasNext && cursor != nil && *cursor != "" && owner != "" && repoName != "" {
+		paginatedQuery := `
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    vulnerabilityAlerts(first: 100, after: $cursor, states: OPEN) {
+      totalCount
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        securityVulnerability {
+          severity
+          package {
+            name
+          }
+        }
+      }
+    }
+  }
+}
+`
+		const maxExtraPages = 25 // Up to 2,525 alerts
+		for page := 0; page < maxExtraPages && hasNext && cursor != nil && *cursor != ""; page++ {
+			var resp struct {
+				Repository *struct {
+					VulnerabilityAlerts vulnerabilityAlertsPage `json:"vulnerabilityAlerts"`
+				} `json:"repository"`
+			}
+			vars := map[string]interface{}{
+				"owner":  owner,
+				"name":   repoName,
+				"cursor": *cursor,
+			}
+			if err := c.queryGraphQL(ctx, paginatedQuery, vars, &resp); err != nil || resp.Repository == nil {
+				break
+			}
+			vaPage := resp.Repository.VulnerabilityAlerts
+			accumulateVulnerabilityNodes(vaPage.Nodes, &crit, &high, &med, &low, &packages, seenPkg)
+			hasNext = vaPage.PageInfo.HasNextPage
+			cursor = vaPage.PageInfo.EndCursor
+		}
+	}
+
+	total := initial.TotalCount
+	if sum := crit + high + med + low; sum > total {
+		total = sum
+	}
+
+	return SecurityAlertSummary{
+		Repo:        repoName,
+		Critical:    crit,
+		High:        high,
+		Medium:      med,
+		Low:         low,
+		Total:       total,
+		Packages:    packages,
+		LastScanned: time.Now(),
+	}
+}
+
 func (c *Client) FetchRepositoriesAndPRs(ctx context.Context, owner string) ([]Repository, []PullRequest, []SquadEvent, map[string]SecurityAlertSummary, error) {
 	// Query 1: Repositories, default branch commit history, and vulnerability alerts with pagination
 	repoQueryWithAlerts := `
@@ -486,6 +595,10 @@ query($login: String!, $cursor: String) {
         }
         vulnerabilityAlerts(first: 25, states: OPEN) {
           totalCount
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
           nodes {
             securityVulnerability {
               severity
@@ -531,17 +644,7 @@ query($login: String!, $cursor: String) {
 				} `json:"history"`
 			} `json:"target"`
 		} `json:"defaultBranchRef"`
-		VulnerabilityAlerts struct {
-			TotalCount int `json:"totalCount"`
-			Nodes      []struct {
-				SecurityVulnerability struct {
-					Severity string `json:"severity"`
-					Package  struct {
-						Name string `json:"name"`
-					} `json:"package"`
-				} `json:"securityVulnerability"`
-			} `json:"nodes"`
-		} `json:"vulnerabilityAlerts"`
+		VulnerabilityAlerts vulnerabilityAlertsPage `json:"vulnerabilityAlerts"`
 	}
 
 	type pageInfo struct {
@@ -659,6 +762,12 @@ query($login: String!, $cursor: String) {
 	var repos []Repository
 	var commitEvents []SquadEvent
 	securityMap := make(map[string]SecurityAlertSummary)
+	type pendingAlerts struct {
+		owner string
+		repo  string
+		page  vulnerabilityAlertsPage
+	}
+	var needsExtraAlerts []pendingAlerts
 
 	for _, node := range allNodes {
 		desc := ""
@@ -729,38 +838,38 @@ query($login: String!, $cursor: String) {
 			}
 		}
 
-		// Parse Vulnerability Alerts
-		crit, high, med, low := 0, 0, 0, 0
-		var packages []string
-		seenPkg := make(map[string]bool)
-		for _, va := range node.VulnerabilityAlerts.Nodes {
-			pkgName := va.SecurityVulnerability.Package.Name
-			if pkgName != "" && !seenPkg[pkgName] {
-				seenPkg[pkgName] = true
-				packages = append(packages, pkgName)
-			}
-			switch strings.ToUpper(va.SecurityVulnerability.Severity) {
-			case "CRITICAL":
-				crit++
-			case "HIGH":
-				high++
-			case "MODERATE":
-				med++
-			case "LOW":
-				low++
-			}
+		// Parse Vulnerability Alerts (defer multi-page fetches for >25 CVEs to bounded concurrent pool)
+		if node.VulnerabilityAlerts.PageInfo.HasNextPage && node.VulnerabilityAlerts.PageInfo.EndCursor != nil && *node.VulnerabilityAlerts.PageInfo.EndCursor != "" {
+			needsExtraAlerts = append(needsExtraAlerts, pendingAlerts{
+				owner: realOwner,
+				repo:  node.Name,
+				page:  node.VulnerabilityAlerts,
+			})
+		} else {
+			securityMap[node.Name] = c.buildSecuritySummary(ctx, realOwner, node.Name, node.VulnerabilityAlerts)
 		}
+	}
 
-		securityMap[node.Name] = SecurityAlertSummary{
-			Repo:        node.Name,
-			Critical:    crit,
-			High:        high,
-			Medium:      med,
-			Low:         low,
-			Total:       node.VulnerabilityAlerts.TotalCount,
-			Packages:    packages,
-			LastScanned: time.Now(),
+	if len(needsExtraAlerts) > 0 {
+		const maxAlertWorkers = 4
+		sem := make(chan struct{}, maxAlertWorkers)
+		var secMu sync.Mutex
+		var secWg sync.WaitGroup
+		for _, item := range needsExtraAlerts {
+			item := item
+			secWg.Add(1)
+			go func() {
+				defer secWg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				sum := c.buildSecuritySummary(ctx, item.owner, item.repo, item.page)
+				secMu.Lock()
+				securityMap[item.repo] = sum
+				secMu.Unlock()
+			}()
 		}
+		secWg.Wait()
 	}
 
 	// Query 2: Fetch open PRs across the organization/user using GitHub indexed search API with pagination
@@ -987,6 +1096,10 @@ query($owner: String!, $name: String!) {
     }
     vulnerabilityAlerts(first: 20, states: OPEN) {
       totalCount
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
       nodes {
         securityVulnerability {
           severity
@@ -1128,17 +1241,7 @@ query($owner: String!, $name: String!) {
 				} `json:"history"`
 			} `json:"target"`
 		} `json:"defaultBranchRef"`
-		VulnerabilityAlerts struct {
-			TotalCount int `json:"totalCount"`
-			Nodes      []struct {
-				SecurityVulnerability struct {
-					Severity string `json:"severity"`
-					Package  struct {
-						Name string `json:"name"`
-					} `json:"package"`
-				} `json:"securityVulnerability"`
-			} `json:"nodes"`
-		} `json:"vulnerabilityAlerts"`
+		VulnerabilityAlerts vulnerabilityAlertsPage `json:"vulnerabilityAlerts"`
 		PullRequests struct {
 			Nodes []struct {
 				Number     int    `json:"number"`
@@ -1252,37 +1355,8 @@ query($owner: String!, $name: String!) {
 		}
 	}
 
-	crit, high, med, low := 0, 0, 0, 0
-	var packages []string
-	seenPkg := make(map[string]bool)
-	for _, va := range node.VulnerabilityAlerts.Nodes {
-		pkgName := va.SecurityVulnerability.Package.Name
-		if pkgName != "" && !seenPkg[pkgName] {
-			seenPkg[pkgName] = true
-			packages = append(packages, pkgName)
-		}
-		switch strings.ToUpper(va.SecurityVulnerability.Severity) {
-		case "CRITICAL":
-			crit++
-		case "HIGH":
-			high++
-		case "MODERATE":
-			med++
-		case "LOW":
-			low++
-		}
-	}
-
-	secSummary := &SecurityAlertSummary{
-		Repo:        node.Name,
-		Critical:    crit,
-		High:        high,
-		Medium:      med,
-		Low:         low,
-		Total:       node.VulnerabilityAlerts.TotalCount,
-		Packages:    packages,
-		LastScanned: time.Now(),
-	}
+	sum := c.buildSecuritySummary(ctx, realOwner, node.Name, node.VulnerabilityAlerts)
+	secSummary := &sum
 
 	var prs []PullRequest
 	for _, p := range node.PullRequests.Nodes {

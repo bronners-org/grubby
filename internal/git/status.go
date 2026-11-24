@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-runewidth"
 )
@@ -25,15 +26,16 @@ const (
 )
 
 type RepoGitStatus struct {
-	RepoName    string
-	LocalPath   string
-	IsCloned    bool
-	Branch      string
-	IsDirty     bool
-	Ahead       int
-	Behind      int
-	State       GitState
-	HasUpstream bool
+	RepoName     string
+	LocalPath    string
+	IsCloned     bool
+	Branch       string
+	IsDirty      bool
+	Ahead        int
+	Behind       int
+	State        GitState
+	HasUpstream  bool
+	IndexModTime time.Time
 }
 
 func (s RepoGitStatus) Badge() string {
@@ -180,6 +182,9 @@ func InspectRepo(ctx context.Context, repoName, dir string) RepoGitStatus {
 	if out, err := cmd.Output(); err == nil {
 		if len(strings.TrimSpace(string(out))) > 0 {
 			st.IsDirty = true
+			if info, statErr := os.Stat(filepath.Join(gitDir, "index")); statErr == nil {
+				st.IndexModTime = info.ModTime()
+			}
 		}
 	}
 

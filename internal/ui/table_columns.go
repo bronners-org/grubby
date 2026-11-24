@@ -33,8 +33,11 @@ func computeRepoColumns(termWidth int) RepoColumns {
 	}
 
 	summaryW := 21
+	if w >= 96 {
+		summaryW = 24
+	}
 	gitW := 24
-	fixedWidth := 3 + summaryW + gitW // 48
+	fixedWidth := 3 + summaryW + gitW // 48 or 51
 	elastic := w - fixedWidth
 
 	nameW := elastic * 60 / 100

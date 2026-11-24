@@ -483,11 +483,18 @@ func (m Model) handleManageSquadModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.SquadManageMode = SquadModeOverview
 				m.ModalInput.Reset()
 				m.ModalInput.Blur()
-				return m, tea.Batch(
-					func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Added org '%s' to squad '%s'", orgName, squadName)) },
-					m.loadDataCmd(),
-					m.syncSquadsFileCmd(),
-				)
+				if m.Config != nil {
+					m.LastKnownSquadOrgs = m.Config.GetActiveSquadOrgs()
+				}
+				if m.GHClient != nil {
+					m.Loading = true
+					return m, tea.Batch(
+						func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Added org '%s' to squad '%s' — scanning repos...", orgName, squadName)) },
+						m.syncSquadAndReloadDataCmd(),
+						m.Spinner.Tick,
+					)
+				}
+				return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Added org '%s' to squad '%s'", orgName, squadName)) }
 			}
 			m.SquadManageMode = SquadModeOverview
 			m.ModalInput.Reset()
@@ -536,11 +543,18 @@ func (m Model) handleManageSquadModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.SquadManageMode = SquadModeOverview
 			m.SelectedSquadMembers = make(map[string]bool)
-			return m, tea.Batch(
-				func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Removed %d organization(s) from squad", removedCount)) },
-				m.loadDataCmd(),
-				m.syncSquadsFileCmd(),
-			)
+			if m.Config != nil {
+				m.LastKnownSquadOrgs = m.Config.GetActiveSquadOrgs()
+			}
+			if m.GHClient != nil {
+				m.Loading = true
+				return m, tea.Batch(
+					func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Removed %d organization(s) from squad", removedCount)) },
+					m.syncSquadAndReloadDataCmd(),
+					m.Spinner.Tick,
+				)
+			}
+			return m, func() tea.Msg { return StatusToastMsg(fmt.Sprintf("Removed %d organization(s) from squad", removedCount)) }
 		}
 
 	default: // SquadModeOverview

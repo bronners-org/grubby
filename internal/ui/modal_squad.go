@@ -272,6 +272,9 @@ func (m Model) handleSelectSquadModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			selected := squads[m.ModalCursor]
 			if m.Config != nil {
 				_ = m.Config.CreateSquad(selected.Name, selected.DisplayName, selected.Members)
+				if len(selected.Organizations) > 0 && len(m.Config.GetOrgsForSquad(selected.Name)) == 0 {
+					_ = m.Config.SetSquadOrgs(selected.Name, selected.Organizations)
+				}
 				if len(selected.Repos) > 0 {
 					_ = m.Config.SetSquadRepos(selected.Name, selected.Repos)
 				}
@@ -309,9 +312,9 @@ func (m Model) handleSelectSquadModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.SquadEvents = immediateEvents
 			}
 
-			// Trigger refresh of squad activity and squad tasks
+			// Trigger refresh of squad activity and squad tasks (plus repo scan if orgs changed)
 			allCommits := m.AllCommitEvents
-			return m, tea.Batch(
+			switchCmds := []tea.Cmd{
 				func() tea.Msg {
 					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 					defer cancel()
@@ -322,7 +325,16 @@ func (m Model) handleSelectSquadModalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				},
 				m.loadTasksCmd(),
-			)
+			}
+			if m.Config != nil {
+				newOrgs := m.Config.GetActiveSquadOrgs()
+				if !sameStringSetCI(m.LastKnownSquadOrgs, newOrgs) && m.GHClient != nil {
+					m.LastKnownSquadOrgs = newOrgs
+					m.Loading = true
+					switchCmds = append(switchCmds, m.loadDataCmd(), m.Spinner.Tick)
+				}
+			}
+			return m, tea.Batch(switchCmds...)
 		}
 	}
 	return m, nil

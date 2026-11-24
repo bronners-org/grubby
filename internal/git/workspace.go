@@ -177,8 +177,13 @@ func (w *WorkspaceManager) ScanWorkspaces(ctx context.Context, knownRepos []stri
 			if p, ok := clonedDirs[short]; ok {
 				return p, true
 			}
+			clean = short
 		}
-		return w.FindRepoDir(name)
+		norm := strings.TrimSuffix(strings.TrimSuffix(clean, ".git"), "-main")
+		if p, ok := clonedDirs[norm]; ok {
+			return p, true
+		}
+		return "", false
 	}
 
 	targets := knownRepos
@@ -192,36 +197,59 @@ func (w *WorkspaceManager) ScanWorkspaces(ctx context.Context, knownRepos []stri
 		}
 	}
 
-	results := make(map[string]RepoGitStatus)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
+	results := make(map[string]RepoGitStatus, len(targets))
+	var toInspect []struct {
+		repo string
+		path string
+	}
 
 	for _, repo := range targets {
-		repo := repo
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var st RepoGitStatus
-			if path, found := findDir(repo); found {
-				st = InspectRepo(ctx, repo, path)
-			} else {
-				st = RepoGitStatus{
-					RepoName:  repo,
-					LocalPath: filepath.Join(w.workspaceDir, repo),
-					IsCloned:  false,
-					State:     StateNotCloned,
-				}
+		if path, found := findDir(repo); found {
+			toInspect = append(toInspect, struct {
+				repo string
+				path string
+			}{repo: repo, path: path})
+		} else {
+			st := RepoGitStatus{
+				RepoName:  repo,
+				LocalPath: filepath.Join(w.workspaceDir, repo),
+				IsCloned:  false,
+				State:     StateNotCloned,
 			}
-			mu.Lock()
 			results[repo] = st
 			if strings.Contains(repo, "/") {
 				short := repo[strings.LastIndex(repo, "/")+1:]
 				results[short] = st
 			}
-			mu.Unlock()
-		}()
+		}
 	}
-	wg.Wait()
+
+	if len(toInspect) > 0 {
+		const maxWorkers = 4
+		sem := make(chan struct{}, maxWorkers)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+
+		for _, item := range toInspect {
+			item := item
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				st := InspectRepo(ctx, item.repo, item.path)
+				mu.Lock()
+				results[item.repo] = st
+				if strings.Contains(item.repo, "/") {
+					short := item.repo[strings.LastIndex(item.repo, "/")+1:]
+					results[short] = st
+				}
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+	}
 
 	// Merge results into w.statusCache (preserving previously known repositories)
 	w.mu.Lock()

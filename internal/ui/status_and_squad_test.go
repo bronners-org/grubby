@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"grubby/internal/config"
+	"grubby/internal/git"
 	"grubby/internal/github"
 	"grubby/internal/storage"
 )
@@ -604,6 +605,50 @@ func TestManageSquadModal_Organizations(t *testing.T) {
 		if o == "bronners-org" {
 			t.Fatalf("expected bronners-org to be removed from squad organizations: %v", squad.Organizations)
 		}
+	}
+}
+
+func TestAutoRefreshTick_OrgChangeTriggersScanAndGitScanBackedOff(t *testing.T) {
+	cfg := &config.Config{
+		ActiveSquad: "core",
+		Squads: []config.SquadConfig{
+			{Name: "core", DisplayName: "Core", Members: []string{"alice"}, Organizations: []string{"org-1"}},
+		},
+	}
+	tmpDir := t.TempDir()
+	mgr := git.NewWorkspaceManager(tmpDir)
+	ghClient, _ := github.NewClientWithOptions(github.ClientOptions{Token: "dummy"})
+
+	m := InitialModel(cfg, ghClient, mgr, "org-1")
+	m.Loading = false
+	m.LastRefreshTime = time.Now()
+	m.LastStatusCheck = time.Now()
+	m.LastDiscussionsSync = time.Now()
+	m.LastGitScanTime = time.Now() // Just scanned
+	m.Repos = []github.Repository{{Name: "r1", Owner: "org-1"}}
+
+	// 1. AutoRefreshTickMsg within 30s of LastGitScanTime should NOT start git workspace scan
+	res, _ := m.Update(AutoRefreshTickMsg(time.Now()))
+	m = res.(Model)
+	if m.ScanningGit {
+		t.Errorf("expected git scan to be backed off within 30s window")
+	}
+	if m.Loading {
+		t.Errorf("expected no GitHub loadData when orgs unchanged and within refresh interval")
+	}
+
+	// 2. Adding a new org to the active squad in config should be detected on tick and trigger scan
+	_ = cfg.AddOrgToSquad("core", "org-2")
+	res, cmd := m.Update(AutoRefreshTickMsg(time.Now()))
+	m = res.(Model)
+	if !m.Loading {
+		t.Errorf("expected m.Loading=true when new org added to squad")
+	}
+	if !sameStringSetCI(m.LastKnownSquadOrgs, []string{"org-1", "org-2"}) {
+		t.Errorf("expected LastKnownSquadOrgs to update to [org-1, org-2], got %v", m.LastKnownSquadOrgs)
+	}
+	if cmd == nil {
+		t.Errorf("expected tick to return batch command triggering loadDataCmd")
 	}
 }
 
