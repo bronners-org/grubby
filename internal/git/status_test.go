@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -291,5 +292,50 @@ func TestScanWorkspacesMergingAndSubfolders(t *testing.T) {
 	}
 	if !mgr.GetStatus(ctx, "repo-two").IsCloned {
 		t.Errorf("expected GetStatus(repo-two) short name to be cloned")
+	}
+}
+
+func TestScanWorkspacesLargeMixedWorkspaceAndDirtyIndexModTime(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr := NewWorkspaceManager(tmpDir)
+
+	// Initialize one real dirty git repo
+	dirtyDir := filepath.Join(tmpDir, "dirty-svc")
+	_ = os.MkdirAll(dirtyDir, 0o755)
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dirtyDir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test User")
+	_ = os.WriteFile(filepath.Join(dirtyDir, "README.md"), []byte("hello"), 0o644)
+	runGit("add", ".")
+	runGit("commit", "-m", "init")
+	// Make dirty untracked file
+	_ = os.WriteFile(filepath.Join(dirtyDir, "untracked.txt"), []byte("dirty"), 0o644)
+
+	known := make([]string, 0, 150)
+	known = append(known, "dirty-svc")
+	for i := 1; i < 150; i++ {
+		known = append(known, fmt.Sprintf("uncloned-repo-%03d", i))
+	}
+
+	statuses := mgr.ScanWorkspaces(context.Background(), known)
+	if len(statuses) < 150 {
+		t.Fatalf("expected at least 150 statuses, got %d", len(statuses))
+	}
+	st := statuses["dirty-svc"]
+	if !st.IsCloned || !st.IsDirty {
+		t.Fatalf("expected dirty-svc to be cloned and dirty, got %+v", st)
+	}
+	if st.IndexModTime.IsZero() {
+		t.Errorf("expected IndexModTime to be populated for dirty repo during ScanWorkspaces")
+	}
+	uncloned := statuses["uncloned-repo-149"]
+	if uncloned.IsCloned || uncloned.State != StateNotCloned {
+		t.Errorf("expected uncloned repo to be StateNotCloned, got %+v", uncloned)
 	}
 }

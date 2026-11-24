@@ -126,7 +126,7 @@ func GetTmuxSessions() map[string]TmuxSessionInfo {
 	}
 
 	cachedTmuxMap = sessions
-	cachedTmuxExpires = time.Now().Add(5 * time.Second)
+	cachedTmuxExpires = time.Now().Add(15 * time.Second)
 
 	res := make(map[string]TmuxSessionInfo, len(sessions))
 	for k, v := range sessions {

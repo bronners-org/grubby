@@ -244,7 +244,7 @@ type ProfilesLoadedMsg struct {
 type AutoRefreshTickMsg time.Time
 
 func autoRefreshTickCmd() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(15*time.Second, func(t time.Time) tea.Msg {
 		return AutoRefreshTickMsg(t)
 	})
 }
@@ -272,6 +272,8 @@ type Model struct {
 	SeenPRNotifications map[string]bool
 	GitStatuses         map[string]git.RepoGitStatus
 	ScanningGit         bool
+	LastGitScanTime     time.Time
+	LastKnownSquadOrgs  []string
 	RateLimit           github.RateLimitInfo
 	Loading             bool
 	InitialDataLoaded   bool
@@ -735,6 +737,9 @@ func InitialModel(cfg *config.Config, gh *github.Client, gitMgr *git.WorkspaceMa
 	if m.RepoCursor == 0 && len(m.Repos) > 0 {
 		m.RepoCursor = m.firstSelectableRepoIndex()
 	}
+	if cfg != nil {
+		m.LastKnownSquadOrgs = cfg.GetActiveSquadOrgs()
+	}
 
 	return m
 }
@@ -860,14 +865,90 @@ func (m Model) loadDiscussionsCmd() tea.Cmd {
 	}
 }
 
+func sameStringSetCI(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	setA := make(map[string]bool, len(a))
+	for _, s := range a {
+		if c := strings.ToLower(strings.TrimSpace(s)); c != "" {
+			setA[c] = true
+		}
+	}
+	setB := make(map[string]bool, len(b))
+	for _, s := range b {
+		if c := strings.ToLower(strings.TrimSpace(s)); c != "" {
+			setB[c] = true
+		}
+	}
+	if len(setA) != len(setB) {
+		return false
+	}
+	for k := range setA {
+		if !setB[k] {
+			return false
+		}
+	}
+	return true
+}
+
 func (m Model) loadDataCmd() tea.Cmd {
+	return m.loadDataWithOptsCmd(false)
+}
+
+func (m Model) loadDataWithOptsCmd(preserveLocalOrgs bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
+		return m.executeLoadData(ctx, preserveLocalOrgs)
+	}
+}
+
+func (m Model) executeLoadData(ctx context.Context, preserveLocalOrgs bool) tea.Msg {
 		authUser, _ := m.GHClient.GetAuthenticatedUser(ctx)
 		if authUser == "" {
 			authUser = m.CurrentOrg
+		}
+
+		orgTarget := m.CurrentOrg
+		if orgTarget == "" {
+			orgTarget = authUser
+		}
+		centralOwner, centralRepo := m.Config.GetCentralTasksRepo(orgTarget)
+
+		// 1. Synchronize squads from central repo (squads.json) BEFORE fetching org repositories
+		// so any newly added organizations are immediately scanned.
+		var loadedSquads []github.SquadDefinition
+		seenSquads := make(map[string]int)
+
+		if squadsFile, _, err := m.GHClient.FetchSquadsFile(ctx, centralOwner, centralRepo); err == nil && squadsFile != nil && len(squadsFile.Squads) > 0 {
+			for _, s := range squadsFile.Squads {
+				lower := strings.ToLower(s.Name)
+				if idx, exists := seenSquads[lower]; !exists {
+					seenSquads[lower] = len(loadedSquads)
+					loadedSquads = append(loadedSquads, s)
+				} else {
+					loadedSquads[idx].Members = append(loadedSquads[idx].Members, s.Members...)
+					loadedSquads[idx].Repos = append(loadedSquads[idx].Repos, s.Repos...)
+					loadedSquads[idx].Organizations = append(loadedSquads[idx].Organizations, s.Organizations...)
+				}
+			}
+		}
+
+		if len(loadedSquads) > 0 {
+			for _, s := range loadedSquads {
+				_ = m.Config.CreateSquad(s.Name, s.DisplayName, s.Members)
+				if !preserveLocalOrgs && len(s.Organizations) > 0 {
+					_ = m.Config.SetSquadOrgs(s.Name, s.Organizations)
+				}
+				if len(s.Repos) > 0 {
+					_ = m.Config.SetSquadRepos(s.Name, s.Repos)
+				}
+			}
+			if m.DB != nil {
+				_ = m.DB.SaveSquads(loadedSquads)
+			}
 		}
 
 		squadOrgs := m.Config.GetActiveSquadOrgs()
@@ -1001,44 +1082,6 @@ func (m Model) loadDataCmd() tea.Cmd {
 			}
 		}
 
-		orgTarget := m.CurrentOrg
-		if orgTarget == "" {
-			orgTarget = authUser
-		}
-		centralOwner, centralRepo := m.Config.GetCentralTasksRepo(orgTarget)
-
-		// 1. Synchronize squads from central repo (squads.json)
-		var loadedSquads []github.SquadDefinition
-		seenSquads := make(map[string]int)
-
-		if squadsFile, _, err := m.GHClient.FetchSquadsFile(ctx, centralOwner, centralRepo); err == nil && squadsFile != nil && len(squadsFile.Squads) > 0 {
-			for _, s := range squadsFile.Squads {
-				lower := strings.ToLower(s.Name)
-				if idx, exists := seenSquads[lower]; !exists {
-					seenSquads[lower] = len(loadedSquads)
-					loadedSquads = append(loadedSquads, s)
-				} else {
-					loadedSquads[idx].Members = append(loadedSquads[idx].Members, s.Members...)
-					loadedSquads[idx].Repos = append(loadedSquads[idx].Repos, s.Repos...)
-				}
-			}
-		}
-
-		if len(loadedSquads) > 0 {
-			for _, s := range loadedSquads {
-				_ = m.Config.CreateSquad(s.Name, s.DisplayName, s.Members)
-				if len(s.Organizations) > 0 {
-					_ = m.Config.SetSquadOrgs(s.Name, s.Organizations)
-				}
-				if len(s.Repos) > 0 {
-					_ = m.Config.SetSquadRepos(s.Name, s.Repos)
-				}
-			}
-			if m.DB != nil {
-				_ = m.DB.SaveSquads(loadedSquads)
-			}
-		}
-
 		// 2. Synchronize repo-labels.json from central repo
 		if squadLabels, err := m.GHClient.FetchSquadRepoLabels(ctx, centralOwner, centralRepo); err == nil && squadLabels != nil {
 			for repoKey, lbls := range squadLabels.Mappings {
@@ -1112,7 +1155,6 @@ func (m Model) loadDataCmd() tea.Cmd {
 			AllCommitEvents:   commitEvents,
 			RateLimit:         m.GHClient.RateLimit(),
 		}
-	}
 }
 
 func (m Model) fetchSingleRepoCmd(owner, repoName string) tea.Cmd {
@@ -1474,9 +1516,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.Spinner, cmd = m.Spinner.Update(msg)
-		if !m.SplashDismissed {
-			return m, tea.Batch(cmd, m.emitSplashImageCmd())
-		}
 		return m, cmd
 
 	case SplashDoneMsg:
@@ -1496,13 +1535,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		cmds = append(cmds, autoRefreshTickCmd())
 
-		if m.ActiveTab == TabSquad {
-			cmds = append(cmds, m.emitSquadMemberAvatarsCmd())
-		}
-
-		// Fast lightweight workspace scan to immediately detect local branch / dirty changes
-		if len(m.Repos) > 0 && m.GitMgr != nil && !m.ScanningGit {
+		// Workspace git scan backed off to every 30 seconds to minimize CPU consumption
+		if len(m.Repos) > 0 && m.GitMgr != nil && !m.ScanningGit && (m.LastGitScanTime.IsZero() || time.Since(m.LastGitScanTime) >= 30*time.Second) {
 			m.ScanningGit = true
+			m.LastGitScanTime = time.Now()
 			repoNames := make([]string, len(m.Repos))
 			for i, r := range m.Repos {
 				repoNames[i] = r.Name
@@ -1516,8 +1552,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.fetchGitHubStatusCmd())
 		}
 
-		// Poll discussions every 30 seconds
-		if time.Since(m.LastDiscussionsSync) >= 30*time.Second && m.GHClient != nil {
+		// Poll discussions every 45s (or 60s when webhooks are active)
+		discInterval := 45 * time.Second
+		if m.EventSub != nil {
+			discInterval = 60 * time.Second
+		}
+		if time.Since(m.LastDiscussionsSync) >= discInterval && m.GHClient != nil {
 			m.LastDiscussionsSync = time.Now()
 			cmds = append(cmds, m.loadDiscussionsCmd())
 		}
@@ -1527,25 +1567,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.recalculateDiscussionOrder()
 		}
 
-		// Auto-refresh main GitHub data every 5 minutes ONLY when webhooks are not active
-		if m.EventSub == nil && time.Since(m.LastRefreshTime) >= 5*time.Minute && !m.Loading {
+		// Trigger immediate scan if active squad organizations changed (e.g., new org added)
+		orgsChanged := false
+		if m.Config != nil {
+			currOrgs := m.Config.GetActiveSquadOrgs()
+			if !sameStringSetCI(m.LastKnownSquadOrgs, currOrgs) {
+				orgsChanged = true
+				m.LastKnownSquadOrgs = currOrgs
+			}
+		}
+
+		// Periodic repository & org scan: 5m when polling, 10m even when webhooks are active
+		// so new repositories or missed org-level events are still discovered reliably.
+		refreshInterval := 5 * time.Minute
+		if m.EventSub != nil {
+			refreshInterval = 10 * time.Minute
+		}
+		if (orgsChanged || time.Since(m.LastRefreshTime) >= refreshInterval) && !m.Loading && m.GHClient != nil {
 			m.Loading = true
 			m.LastRefreshTime = time.Now()
-			inactiveSkipped := 0
-			if m.DB != nil {
-				_, _, cold, dead, err := m.DB.GetTierCounts()
-				if err == nil && (cold+dead) > 0 {
-					inactiveSkipped = cold + dead
-					if m.GHClient != nil {
+			if orgsChanged {
+				m.StatusMsg = "Scanning repositories for newly added organization(s)..."
+			} else if m.EventSub == nil {
+				inactiveSkipped := 0
+				if m.DB != nil {
+					_, _, cold, dead, err := m.DB.GetTierCounts()
+					if err == nil && (cold+dead) > 0 {
+						inactiveSkipped = cold + dead
 						m.GHClient.RecordRequestSaved(int64(inactiveSkipped))
+						_ = m.DB.IncrementRequestsSaved(int64(inactiveSkipped))
 					}
-					_ = m.DB.IncrementRequestsSaved(int64(inactiveSkipped))
 				}
-			}
-			if inactiveSkipped > 0 {
-				m.StatusMsg = fmt.Sprintf("Auto-refreshing Hot & Warm repos (%d cold/dead skipped)...", inactiveSkipped)
+				if inactiveSkipped > 0 {
+					m.StatusMsg = fmt.Sprintf("Auto-refreshing Hot & Warm repos (%d cold/dead skipped)...", inactiveSkipped)
+				} else {
+					m.StatusMsg = "Auto-refreshing data from GitHub..."
+				}
 			} else {
-				m.StatusMsg = "Auto-refreshing data from GitHub..."
+				m.StatusMsg = "Scanning for new repositories & CVEs..."
 			}
 			m.StatusMsgTimer = time.Now().Add(4 * time.Second)
 			cmds = append(cmds, m.loadDataCmd(), m.Spinner.Tick)
@@ -1958,6 +2017,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.Config != nil {
 				for _, s := range msg.Squads {
 					_ = m.Config.CreateSquad(s.Name, s.DisplayName, s.Members)
+					if len(s.Organizations) > 0 && len(m.Config.GetOrgsForSquad(s.Name)) == 0 {
+						_ = m.Config.SetSquadOrgs(s.Name, s.Organizations)
+					}
 					if len(s.Repos) > 0 {
 						_ = m.Config.SetSquadRepos(s.Name, s.Repos)
 					}
@@ -1966,6 +2028,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.DB != nil {
 				_ = m.DB.SaveSquads(msg.Squads)
 			}
+		}
+		if m.Config != nil {
+			m.LastKnownSquadOrgs = m.Config.GetActiveSquadOrgs()
 		}
 		if m.DB != nil {
 			m.RepoTiers = m.DB.GetAllRepoTiers()
@@ -2721,7 +2786,10 @@ func (m Model) renderTopBar() string {
 		refreshStr = "⟳ Refreshing..."
 	} else if !m.LastRefreshTime.IsZero() {
 		sinceLast := time.Since(m.LastRefreshTime)
-		const autoInterval = 5 * time.Minute
+		autoInterval := 5 * time.Minute
+		if m.EventSub != nil {
+			autoInterval = 10 * time.Minute
+		}
 		untilNext := autoInterval - sinceLast
 		if untilNext < 0 {
 			untilNext = 0
@@ -3171,14 +3239,11 @@ func (m Model) getRepoLastInteractedTime(repoName string, tmuxSessions map[strin
 		}
 	}
 
-	// 4. Local git index modified time
+	// 4. Local git index modified time (pre-populated by ScanWorkspaces to avoid os.Stat during View)
 	st := m.getGitStatus(repoName)
-	if st.IsCloned && st.IsDirty {
-		indexPath := filepath.Join(st.LocalPath, ".git", "index")
-		if info, err := os.Stat(indexPath); err == nil {
-			if info.ModTime().After(t) {
-				t = info.ModTime()
-			}
+	if st.IsCloned && st.IsDirty && !st.IndexModTime.IsZero() {
+		if st.IndexModTime.After(t) {
+			t = st.IndexModTime
 		}
 	}
 
@@ -3316,6 +3381,23 @@ func (m Model) syncSquadsFileCmd() tea.Cmd {
 			_ = m.DB.SaveSquads(squadDefs)
 		}
 		return nil
+	}
+}
+
+// syncSquadAndReloadDataCmd uploads squad configuration changes before scanning repositories,
+// preventing remote squads.json from overwriting locally added/removed organizations while scanning new orgs.
+func (m Model) syncSquadAndReloadDataCmd() tea.Cmd {
+	syncCmd := m.syncSquadsFileCmd()
+	return func() tea.Msg {
+		if syncCmd != nil {
+			_ = syncCmd()
+		}
+		if m.GHClient == nil || m.Config == nil {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return m.executeLoadData(ctx, true)
 	}
 }
 

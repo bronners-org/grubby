@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -474,5 +475,171 @@ func TestFetchSingleRepo(t *testing.T) {
 	}
 	if secSummary == nil || secSummary.High != 1 || secSummary.Total != 1 {
 		t.Errorf("unexpected secSummary: %+v", secSummary)
+	}
+}
+
+func TestFetchRepositoriesAndPRs_PaginatesOver25CVEs(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	makeAlertNodes := func(crit, high, mod, low int) []map[string]interface{} {
+		var nodes []map[string]interface{}
+		appendSev := func(sev string, n int) {
+			for i := 0; i < n; i++ {
+				nodes = append(nodes, map[string]interface{}{
+					"securityVulnerability": map[string]interface{}{
+						"severity": sev,
+						"package":  map[string]string{"name": fmt.Sprintf("pkg-%s-%d", sev, i)},
+					},
+				})
+			}
+		}
+		appendSev("CRITICAL", crit)
+		appendSev("HIGH", high)
+		appendSev("MODERATE", mod)
+		appendSev("LOW", low)
+		return nodes
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" || r.Method != "POST" {
+			http.NotFound(w, r)
+			return
+		}
+		var reqBody struct {
+			Query     string                 `json:"query"`
+			Variables map[string]interface{} `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		if strings.Contains(reqBody.Query, "repositoryOwner") {
+			resp := map[string]interface{}{
+				"data": map[string]interface{}{
+					"repositoryOwner": map[string]interface{}{
+						"repositories": map[string]interface{}{
+							"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": nil},
+							"nodes": []map[string]interface{}{
+								{
+									"databaseId":    1001,
+									"name":          "massive-cve-repo",
+									"nameWithOwner": "corp-org/massive-cve-repo",
+									"owner":         map[string]string{"login": "corp-org"},
+									"pushedAt":      now.Format(time.RFC3339),
+									"updatedAt":     now.Format(time.RFC3339),
+									"url":           "https://github.com/corp-org/massive-cve-repo",
+									"vulnerabilityAlerts": map[string]interface{}{
+										"totalCount": 495,
+										"pageInfo":   map[string]interface{}{"hasNextPage": true, "endCursor": "va-cursor-1"},
+										"nodes":      makeAlertNodes(5, 10, 8, 2), // 25 in first page
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		if strings.Contains(reqBody.Query, "vulnerabilityAlerts(first: 100") {
+			cursorVal, _ := reqBody.Variables["cursor"].(string)
+			var pageNodes []map[string]interface{}
+			hasNext := false
+			nextCursor := ""
+			switch cursorVal {
+			case "va-cursor-1":
+				// 100 alerts
+				pageNodes = makeAlertNodes(10, 40, 30, 20)
+				hasNext = true
+				nextCursor = "va-cursor-2"
+			case "va-cursor-2":
+				// 200 alerts simulated across 2 pages -> 100 here
+				pageNodes = makeAlertNodes(15, 35, 35, 15)
+				hasNext = true
+				nextCursor = "va-cursor-3"
+			case "va-cursor-3":
+				// 100 alerts
+				pageNodes = makeAlertNodes(10, 40, 40, 10)
+				hasNext = true
+				nextCursor = "va-cursor-4"
+			case "va-cursor-4":
+				// 100 alerts
+				pageNodes = makeAlertNodes(5, 45, 35, 15)
+				hasNext = true
+				nextCursor = "va-cursor-5"
+			case "va-cursor-5":
+				// Remaining 70 alerts -> total 25 + 100 + 100 + 100 + 100 + 70 = 495
+				pageNodes = makeAlertNodes(5, 25, 25, 15)
+				hasNext = false
+			}
+
+			var endPtr interface{}
+			if nextCursor != "" {
+				endPtr = nextCursor
+			}
+			resp := map[string]interface{}{
+				"data": map[string]interface{}{
+					"repository": map[string]interface{}{
+						"vulnerabilityAlerts": map[string]interface{}{
+							"totalCount": 495,
+							"pageInfo":   map[string]interface{}{"hasNextPage": hasNext, "endCursor": endPtr},
+							"nodes":      pageNodes,
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		if strings.Contains(reqBody.Query, "search(query:") {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"search": map[string]interface{}{
+						"issueCount": 0,
+						"pageInfo":   map[string]interface{}{"hasNextPage": false, "endCursor": nil},
+						"nodes":      []interface{}{},
+					},
+				},
+			})
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
+	}))
+	defer server.Close()
+
+	client := &Client{
+		token:      "dummy-token",
+		httpClient: server.Client(),
+		apiBaseURL: server.URL,
+	}
+
+	_, _, _, secMap, err := client.FetchRepositoriesAndPRs(context.Background(), "corp-org")
+	if err != nil {
+		t.Fatalf("FetchRepositoriesAndPRs failed: %v", err)
+	}
+
+	sum, ok := secMap["massive-cve-repo"]
+	if !ok {
+		t.Fatalf("expected security summary for massive-cve-repo")
+	}
+
+	// Expected totals:
+	// Crit: 5 + 10 + 15 + 10 + 5 + 5 = 50
+	// High: 10 + 40 + 35 + 40 + 45 + 25 = 195
+	// Med:  8 + 30 + 35 + 40 + 35 + 25 = 173
+	// Low:  2 + 20 + 15 + 10 + 15 + 15 = 77
+	// Sum:  50 + 195 + 173 + 77 = 495
+	if sum.Total != 495 {
+		t.Errorf("expected Total 495, got %d", sum.Total)
+	}
+	if sum.Critical != 50 || sum.High != 195 || sum.Medium != 173 || sum.Low != 77 {
+		t.Errorf("expected (C=50, H=195, M=173, L=77), got (C=%d, H=%d, M=%d, L=%d)", sum.Critical, sum.High, sum.Medium, sum.Low)
 	}
 }
